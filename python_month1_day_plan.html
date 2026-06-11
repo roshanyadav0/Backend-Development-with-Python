@@ -1,0 +1,230 @@
+
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: var(--font-sans); }
+  .plan-wrap { padding: 1rem 0 2rem; }
+  .week-label { font-size: 12px; font-weight: 500; color: var(--color-text-secondary); text-transform: uppercase; letter-spacing: 0.06em; margin: 1.5rem 0 0.5rem; }
+  .day-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; }
+  .day-card {
+    background: var(--color-background-primary);
+    border: 0.5px solid var(--color-border-tertiary);
+    border-radius: var(--border-radius-md);
+    padding: 10px 12px;
+    cursor: pointer;
+    transition: border-color 0.15s;
+    position: relative;
+  }
+  .day-card:hover { border-color: var(--color-border-secondary); }
+  .day-card.active { border-color: #7F77DD; background: #EEEDFE; }
+  .day-card.milestone { border-left: 3px solid #1D9E75; }
+  .day-card.review { border-left: 3px solid #BA7517; }
+  .day-card.project { border-left: 3px solid #1D9E75; }
+  .day-num { font-size: 11px; color: var(--color-text-secondary); margin-bottom: 3px; }
+  .day-title { font-size: 13px; font-weight: 500; color: var(--color-text-primary); line-height: 1.35; }
+  .day-sub { font-size: 11px; color: var(--color-text-secondary); margin-top: 3px; line-height: 1.4; }
+  .tag { display: inline-block; font-size: 10px; padding: 2px 6px; border-radius: 4px; margin-top: 5px; font-weight: 500; }
+  .tag-topic { background: #EEEDFE; color: #3C3489; }
+  .tag-project { background: #E1F5EE; color: #0F6E56; }
+  .tag-review { background: #FAEEDA; color: #633806; }
+  .tag-rest { background: #F1EFE8; color: #5F5E5A; }
+  .detail-panel {
+    background: var(--color-background-primary);
+    border: 0.5px solid var(--color-border-secondary);
+    border-radius: var(--border-radius-lg);
+    padding: 1.25rem;
+    margin-top: 1.25rem;
+  }
+  .detail-panel h3 { font-size: 15px; font-weight: 500; color: var(--color-text-primary); margin-bottom: 0.5rem; }
+  .detail-panel p { font-size: 13px; color: var(--color-text-secondary); line-height: 1.6; }
+  .detail-panel ul { margin: 0.5rem 0 0 1rem; }
+  .detail-panel li { font-size: 13px; color: var(--color-text-secondary); line-height: 1.7; }
+  .detail-panel .res { font-size: 12px; color: #185FA5; margin-top: 0.5rem; }
+  .legend { display: flex; gap: 16px; margin-bottom: 1rem; flex-wrap: wrap; }
+  .leg-item { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--color-text-secondary); }
+  .leg-dot { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+</style>
+
+<div class="plan-wrap">
+  <h2 class="sr-only">Month 1 Python Mastery — Day-by-day 30-day plan</h2>
+
+  <div class="legend">
+    <div class="leg-item"><div class="leg-dot" style="background:#7F77DD"></div>Topic day</div>
+    <div class="leg-item"><div class="leg-dot" style="background:#1D9E75; border-left: none;"></div>Project / milestone</div>
+    <div class="leg-item"><div class="leg-dot" style="background:#BA7517"></div>Review & consolidate</div>
+    <div class="leg-item"><div class="leg-dot" style="background:#888780"></div>Rest / buffer</div>
+  </div>
+
+  <div id="weeks-container"></div>
+
+  <div id="detail" style="display:none;" class="detail-panel"></div>
+</div>
+
+<script>
+const days = [
+  { day:1, title:"Python syntax & variables", sub:"types, operators, f-strings", type:"topic", tag:"topic",
+    tasks:["Install Python 3.12 + VS Code","Work through python.org tutorial §1-§3","Practice: write 10 small scripts using variables, print, input","Understand int, float, str, bool, None"],
+    res:"python.org/doc/tutorial + CS50P Week 0" },
+  { day:2, title:"Data types deep dive", sub:"mutability, casting, type()", type:"topic", tag:"topic",
+    tasks:["Explore all built-in types","Casting: int(), str(), float()","Type checking with isinstance()","Mini challenge: build a simple unit converter"],
+    res:"Corey Schafer YT: Python Basics playlist" },
+  { day:3, title:"Lists & tuples", sub:"indexing, slicing, methods", type:"topic", tag:"topic",
+    tasks:["List methods: append, extend, pop, sort, reverse","Slicing: list[start:stop:step]","Tuple immutability & when to use","Nested lists practice"],
+    res:"Automate the Boring Stuff Ch.4" },
+  { day:4, title:"Sets & dictionaries", sub:"hashing, CRUD, nested dicts", type:"topic", tag:"topic",
+    tasks:["Set operations: union, intersection, difference","Dict methods: keys(), values(), items(), get()","Nested dicts & real-world use","Challenge: word frequency counter"],
+    res:"Corey Schafer YT: Dictionaries" },
+  { day:5, title:"Review week 1 + practice", sub:"consolidate collections", type:"review", tag:"review",
+    tasks:["Redo 3 exercises from days 1–4 from memory","Build: contact book using a list of dicts","Write 10 quiz questions on collections for yourself","Fix any gaps"],
+    res:"Any resource from week 1" },
+  { day:6, title:"Functions fundamentals", sub:"def, return, scope, docstrings", type:"topic", tag:"topic",
+    tasks:["def, return, None returns","Scope: local vs global vs enclosing","Write docstrings for every function","Challenge: FizzBuzz as a function"],
+    res:"CS50P Week 2" },
+  { day:7, title:"*args & **kwargs", sub:"flexible function signatures", type:"topic", tag:"topic",
+    tasks:["Positional vs keyword args","*args unpacking, **kwargs unpacking","Default parameter values & pitfalls","Build: a flexible log() function"],
+    res:"Corey Schafer YT: *args & **kwargs" },
+  { day:8, title:"Decorators", sub:"wrappers, functools.wraps", type:"topic", tag:"topic",
+    tasks:["First-class functions recap","Write a timer decorator","Write a logger decorator","@functools.wraps — why it matters","Apply to your own functions"],
+    res:"Corey Schafer YT: Decorators" },
+  { day:9, title:"OOP — classes & objects", sub:"__init__, attributes, methods", type:"topic", tag:"topic",
+    tasks:["Define a class, instantiate objects","Instance vs class attributes","Instance methods, self","Build: Expense class for your project"],
+    res:"CS50P Week 8 + Corey Schafer OOP series" },
+  { day:10, title:"OOP — inheritance & dunder", sub:"super(), __repr__, __str__", type:"topic", tag:"topic",
+    tasks:["Inheritance with super()","Method overriding","__repr__ vs __str__","__eq__, __lt__ for comparisons","Build: ExpenseCategory subclass"],
+    res:"Corey Schafer YT: Magic/Dunder Methods" },
+  { day:11, title:"Review week 2 + OOP practice", sub:"solidify functions & classes", type:"review", tag:"review",
+    tasks:["Rewrite week 2 exercises from scratch","Refactor your Expense class","Peer review: read 2 others' OOP code on GitHub","Fill any gaps in decorators or dunder methods"],
+    res:"python.org/doc/datamodel" },
+  { day:12, title:"File handling", sub:"open, read, write, with statement", type:"topic", tag:"topic",
+    tasks:["open() modes: r, w, a, rb","The with statement & why","Read/write text files","os.path for file checking","Write: save Expense list to .txt"],
+    res:"Automate the Boring Stuff Ch.9" },
+  { day:13, title:"JSON files", sub:"json.load, json.dump, serialisation", type:"topic", tag:"topic",
+    tasks:["json.load() and json.dump()","json.loads() and json.dumps()","Handle missing/corrupt JSON files","Save & load your Expense objects as JSON"],
+    res:"python.org/doc/json" },
+  { day:14, title:"Error handling", sub:"try/except/else/finally", type:"topic", tag:"topic",
+    tasks:["try/except/else/finally structure","Catch specific exceptions (FileNotFoundError, ValueError)","Raise exceptions","Build: handle missing file in CLI app"],
+    res:"CS50P Week 3" },
+  { day:15, title:"Custom exceptions", sub:"Exception subclasses", type:"topic", tag:"topic",
+    tasks:["Define custom exception classes","Raise and catch them","Add custom error messages","Add to your Expense project: InvalidAmountError, DuplicateExpenseError"],
+    res:"Corey Schafer YT: Exceptions" },
+  { day:16, title:"Comprehensions", sub:"list, dict, set, conditional", type:"topic", tag:"topic",
+    tasks:["List comprehensions with conditions","Dict comprehensions","Set comprehensions","Nested comprehensions (sparingly)","Refactor your filter functions to use comprehensions"],
+    res:"python.org/doc/tutorial §5" },
+  { day:17, title:"Review week 3 + integrate", sub:"file + error + comprehensions", type:"review", tag:"review",
+    tasks:["Combine: read JSON → filter with comprehensions → handle errors","Write 5 exercises using all three","Document your Expense class fully","Deploy review: check all edge cases"],
+    res:"Automate the Boring Stuff Ch.8-9" },
+  { day:18, title:"Modules & packages", sub:"import, from, __name__", type:"topic", tag:"topic",
+    tasks:["import vs from import vs import as","__name__ == '__main__' guard","Build a utils.py module","Understand sys.path"],
+    res:"python.org/doc/modules" },
+  { day:19, title:"Packages & __init__.py", sub:"directory structure, relative imports", type:"topic", tag:"topic",
+    tasks:["Create a package folder with __init__.py","Relative imports","Standard library exploration: datetime, os, sys, pathlib","Split your expense project into a package"],
+    res:"Corey Schafer YT: Modules & Packages" },
+  { day:20, title:"Virtual environments", sub:"venv, pip, requirements.txt", type:"topic", tag:"topic",
+    tasks:["Create and activate venv","pip install, pip freeze","requirements.txt — create & use","Understand why venv exists","Set up your project properly with venv"],
+    res:"python.org/doc/venv" },
+  { day:21, title:"Type hints", sub:"PEP 604, 3.10+ syntax", type:"topic", tag:"topic",
+    tasks:["Basic annotations: str, int, list[str]","Optional, Union (3.10: X | Y syntax)","Return type annotations","Annotate your entire Expense project","Run mypy to check"],
+    res:"mypy.readthedocs.io + PEP 604" },
+  { day:22, title:"Review week 4", sub:"modules, venv, type hints", type:"review", tag:"review",
+    tasks:["Audit your full project structure","Ensure proper package layout","All functions typed — run mypy clean","Write README for project"],
+    res:"All week 4 resources" },
+  { day:23, title:"CLI Expense Tracker — core", sub:"add, view, delete expenses", type:"project", tag:"project",
+    tasks:["argparse or sys.argv for CLI","Add expense: name, amount, category, date","View all expenses as table","Delete by ID","Save to expenses.json on every operation"],
+    res:"Automate the Boring Stuff Ch.10" },
+  { day:24, title:"CLI Tracker — filters", sub:"filter by category & date", type:"project", tag:"project",
+    tasks:["Filter expenses by category","Filter by date range","Use comprehensions + type hints throughout","Handle bad input gracefully with custom exceptions"],
+    res:"Your own code from days 12–21" },
+  { day:25, title:"CLI Tracker — polish", sub:"OOP, error handling, types", type:"project", tag:"project",
+    tasks:["Refactor into proper OOP: ExpenseTracker class","Full error handling — no crashes","All functions decorated/typed","Run through 10 manual test cases"],
+    res:"None — build from memory" },
+  { day:26, title:"Testing basics", sub:"assert, unittest or pytest", type:"topic", tag:"topic",
+    tasks:["Write 5 assert-based tests","Intro to pytest: pip install pytest","Write tests for add/delete/filter in your tracker","Run pytest and fix failures"],
+    res:"pytest.org/getting-started" },
+  { day:27, title:"Code quality", sub:"PEP8, black, pylint", type:"topic", tag:"topic",
+    tasks:["Run black on your whole project","Run pylint — fix top 5 issues","PEP8 naming conventions","Write clean, idiomatic Python"],
+    res:"pep8.org + black docs" },
+  { day:28, title:"Final project review", sub:"end-to-end walkthrough", type:"project", tag:"project",
+    tasks:["Walk through entire project as if demoing to an employer","Fix any remaining issues","Ensure: OOP, file handling, error handling, type hints, comprehensions, modules all present","Push to GitHub"],
+    res:"GitHub" },
+  { day:29, title:"Month 1 deep review", sub:"go back to weakest topics", type:"review", tag:"review",
+    tasks:["Review your notes from each week","Pick 2 topics you felt weakest on","Redo exercises for those topics","Ask Claude to quiz you on them"],
+    res:"Your own notes + any resource" },
+  { day:30, title:"Rest & plan Month 2", sub:"celebrate, then scope ahead", type:"rest", tag:"rest",
+    tasks:["Rest — you earned it","Write a 1-page summary of what you learned","Note 3 things still confusing","Research Month 2 topics (web dev or data)"],
+    res:"None" },
+];
+
+const tagMap = {
+  topic: { label:"topic", cls:"tag-topic" },
+  project: { label:"project", cls:"tag-project" },
+  review: { label:"review", cls:"tag-review" },
+  rest: { label:"rest", cls:"tag-rest" },
+};
+
+const typeStyle = {
+  topic: "",
+  project: "project",
+  review: "review",
+  rest: "",
+};
+
+const weeks = [
+  { label:"Week 1 — Core syntax & data structures", days:[1,2,3,4,5] },
+  { label:"Week 2 — Functions, OOP, decorators", days:[6,7,8,9,10,11] },
+  { label:"Week 3 — File I/O, error handling, comprehensions", days:[12,13,14,15,16,17] },
+  { label:"Week 4 — Modules, venv, type hints", days:[18,19,20,21,22] },
+  { label:"Week 5 — Build, test, polish & review", days:[23,24,25,26,27,28,29,30] },
+];
+
+let activeDay = null;
+const container = document.getElementById('weeks-container');
+
+weeks.forEach(w => {
+  const lbl = document.createElement('div');
+  lbl.className = 'week-label';
+  lbl.textContent = w.label;
+  container.appendChild(lbl);
+
+  const grid = document.createElement('div');
+  grid.className = 'day-grid';
+
+  w.days.forEach(d => {
+    const info = days[d - 1];
+    const card = document.createElement('div');
+    card.className = 'day-card ' + (typeStyle[info.type] || '');
+    card.dataset.day = d;
+    card.innerHTML = `
+      <div class="day-num">Day ${info.day}</div>
+      <div class="day-title">${info.title}</div>
+      <div class="day-sub">${info.sub}</div>
+      <span class="tag ${tagMap[info.tag].cls}">${tagMap[info.tag].label}</span>
+    `;
+    card.addEventListener('click', () => showDetail(info, card));
+    grid.appendChild(card);
+  });
+  container.appendChild(grid);
+});
+
+function showDetail(info, cardEl) {
+  const panel = document.getElementById('detail');
+  if (activeDay === info.day) {
+    activeDay = null;
+    cardEl.classList.remove('active');
+    panel.style.display = 'none';
+    return;
+  }
+  document.querySelectorAll('.day-card').forEach(c => c.classList.remove('active'));
+  cardEl.classList.add('active');
+  activeDay = info.day;
+
+  panel.style.display = 'block';
+  panel.innerHTML = `
+    <h3>Day ${info.day}: ${info.title}</h3>
+    <p style="margin-top:4px; font-size:12px; color:var(--color-text-secondary);">${info.sub}</p>
+    <ul style="margin-top:10px;">
+      ${info.tasks.map(t => `<li>${t}</li>`).join('')}
+    </ul>
+    <div class="res"><i class="ti ti-books" aria-hidden="true" style="font-size:13px; margin-right:4px;"></i>${info.res}</div>
+  `;
+  panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+</script>

@@ -1,0 +1,8 @@
+Day 1: Python syntax & variables
+types, operators, f-strings
+
+Install Python 3.12 + VS Code
+Work through python.org tutorial §1-§3
+Practice: write 10 small scripts using variables, print, input
+Understand int, float, str, bool, None
+python.org/doc/tutorial + CS50P Week 0
