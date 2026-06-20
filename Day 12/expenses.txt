@@ -1,0 +1,7 @@
+===== Expense Report =====
+Groceries            ₹ 1200.00
+Electricity          ₹  850.50
+Internet             ₹  699.00
+Petrol               ₹  500.00
+------------------------------
+TOTAL                ₹ 3249.50
