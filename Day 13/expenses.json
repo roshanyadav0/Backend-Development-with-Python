@@ -1,0 +1,17 @@
+[
+    {
+        "title": "Coffee",
+        "amount": 50,
+        "category": "Food"
+    },
+    {
+        "title": "Bus",
+        "amount": 20,
+        "category": "Travel"
+    },
+    {
+        "title": "Netflix",
+        "amount": 199,
+        "category": "Entertainment"
+    }
+]
