@@ -1,0 +1,8 @@
+Day 1: Relational concepts
+tables, PKs, FKs, normalisation
+
+What is a relational database and why it exists
+Primary keys, foreign keys, constraints
+1NF, 2NF, 3NF — normalisation with a real example
+Draw the Library API schema: books, members, borrows on paper
+Install PostgreSQL + psql CLI locally
