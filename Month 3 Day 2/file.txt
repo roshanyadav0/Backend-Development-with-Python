@@ -1,0 +1,41 @@
+Setup: the schema, with real constraints
+
+CREATE TABLE books (
+    id SERIAL PRIMARY KEY,
+    title VARCHAR(200) NOT NULL,
+    author VARCHAR(100) NOT NULL,
+    price NUMERIC(6, 2) NOT NULL CHECK (price > 0),
+    available BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMP NOT NULL DEFAULT now()
+);
+
+
+
+The 10 queries
+
+[1] WHERE price < 11 — filtering rows by a condition, the SQL equivalent of Day 24's [b for b in items if b["price"] < 11] — except this filtering happens inside the database, not after pulling every row into Python memory.
+
+[2] WHERE available = true — boolean columns filter exactly like any other condition.
+
+[3] ORDER BY price ASC — sorts every book cheapest-first; ASC is actually the default, so ORDER BY price alone does the same thing.
+
+[4] ORDER BY price DESC LIMIT 3 — the two keywords combine directly: sort descending, then take only the top 3. This is precisely what Field(le=100) capped pagination limits were protecting against in Day 24's app-level code — here it's native.
+
+[5] WHERE author ILIKE '%herbert%' — ILIKE is Postgres's case-insensitive LIKE; % is a wildcard matching anything. This is the exact SQL equivalent of Day 24's filters.author.lower() in b["author"].lower(), just running inside the database instead of a Python list comprehension.
+
+[6] WHERE available = true AND price < 12 — combining conditions with AND, mirroring how filter_books chained multiple if blocks — except this is a single query the database's own query planner can optimize, rather than three sequential Python passes over a list.
+
+[7] GROUP BY author with COUNT(*) — this is genuinely new territory versus anything Month 2 did with dicts: aggregating rows into per-group summaries. Doing this in Python would mean manually building a dictionary of counts yourself; SQL does it in one line.
+
+[8] UPDATE books SET available = false WHERE title = 'Neuromancer' — note the WHERE clause is not optional in practice — an UPDATE with no WHERE updates every row in the table. UPDATE 1 in the output confirms exactly one row matched and changed; always check that count matches your expectation.
+
+[9] DELETE FROM members WHERE email = 'karin@example.com' — same principle as UPDATE: DELETE with no WHERE deletes everything. DELETE 1 confirms scope. This is genuinely destructive in a way Day 10's del db[book_id] also was — but here it's permanent across restarts too, which raises the stakes.
+
+[10] LIMIT 5 OFFSET 5 — this is skip/limit from Day 12 and Day 24, expressed as native SQL: OFFSET skips the first N rows, LIMIT caps how many come back after that. filters.skip/filters.limit in Month 2's Python code will become .offset(filters.skip).limit(filters.limit) calls on a SQLAlchemy query — nearly a direct translation.
+
+
+Exercise
+Run SELECT * FROM books WHERE available = false; — confirm it returns exactly the books you'd expect given the seed data and the one UPDATE above.
+Write a query combining all three: WHERE, ORDER BY, and LIMIT in one statement — e.g., "the 2 cheapest available books."
+Try DELETE FROM books; with no WHERE in a throwaway test — then check SELECT COUNT(*) FROM books; to see the damage, so the danger is visceral rather than just a warning you read past.
+Add a genre column with ALTER TABLE books ADD COLUMN genre VARCHAR(50);, then run an UPDATE to backfill a few values, then GROUP BY genre — previewing tomorrow's territory of altering an existing schema rather than only creating fresh tables.
