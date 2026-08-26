@@ -1,0 +1,70 @@
+Same drill structure as your Week 1 and Week 2 reviews — attempt everything cold before checking against the answer key.
+
+## Explain the full request path: HTTP → FastAPI → Postgres
+
+Before reading further, explain out loud or in writing what happens, in order, when a client sends `POST /borrows`. Be specific about which layer does what — "FastAPI handles it" isn't specific enough.
+
+## Draw it without notes
+
+On paper, draw the six-layer stack from Day 15 from memory: client, FastAPI route, CRUD function, AsyncSession, asyncpg driver, PostgreSQL. For each layer, write one line on what it's actually responsible for — not just its name.
+
+Then check yourself against this:
+
+1. **Client** sends an HTTP request with a JSON body.
+2. **FastAPI route handler** receives it, and Pydantic validates the body against your schema (`BorrowCreate`) before your code even runs — malformed input never reaches your business logic.
+3. **CRUD function** contains the actual business logic — checking availability, constructing the `Borrow` object, deciding what counts as a valid state transition. This layer knows nothing about HTTP.
+4. **AsyncSession** tracks the object you've created, generates the SQL, and manages the transaction boundary — everything since the last `commit()` is one atomic unit.
+5. **asyncpg driver** takes the SQL AsyncSession generated and actually speaks Postgres's wire protocol over the network, asynchronously — this is the layer that lets other requests make progress while this one waits.
+6. **PostgreSQL** executes the query, enforces every constraint (FK, unique, check) regardless of what the layers above assumed, and returns the result.
+
+The two directions worth being explicit about: **the request goes down through all six layers**, and **the response climbs back up through the same six**, layer by layer — the CRUD function gets a `Borrow` object back from the session, FastAPI serializes it back to JSON via `response_model`, and the client gets the HTTP response. Nothing skips a layer in either direction.
+
+If your drawing had the CRUD function directly holding a database connection, or FastAPI touching SQL directly, that's the gap worth closing — the whole point of layering this way is that each layer only talks to its direct neighbors.
+
+## Can you write a migration from scratch?
+
+Attempt this without opening Day 12/13 for reference. Requirement: add a `CHECK` constraint ensuring `books.total_copies` can never be negative or zero — directly closing edge case #7 from Day 16, but enforced at the database level rather than only in Pydantic.
+
+Write the full migration file — `upgrade()`, `downgrade()`, and a sensible `down_revision` — before checking below.
+
+```python
+from alembic import op
+import sqlalchemy as sa
+
+revision = "c3d4e5f6a1b2"
+down_revision = "b2c3d4e5f6a1"   # whatever your last real migration's id is
+
+
+def upgrade():
+    op.create_check_constraint(
+        "ck_books_total_copies_positive",
+        "books",
+        "total_copies > 0"
+    )
+
+
+def downgrade():
+    op.drop_constraint("ck_books_total_copies_positive", "books", type_="check")
+```
+
+If you got this right without looking, you've genuinely internalized Day 12/13 — this is exactly the shape of every future schema change you'll make: name the constraint explicitly (so `downgrade()` can find it again by name), write both directions, point `down_revision` at whatever your actual latest migration is.
+
+**Worth noticing**: this constraint would have caught edge case #7 from Day 16 (negative `total_copies`) even if someone bypassed your Pydantic validation entirely — inserted a row via raw SQL, a bulk import script, or a future teammate's code that forgot to reuse your schema. That's the whole argument for defense in depth from Day 2's constraints lesson: application-level validation is convenient and fast to fail on, but the database constraint is what actually can't be circumvented.
+
+## What would break if you removed a transaction?
+
+Write out a concrete answer using the `create_borrow()` function from Day 15/16 specifically — not a generic "data could be inconsistent" answer. Then check against this:
+
+Recall the shape of `create_borrow()`: it reads the current active-borrow count, checks it against `total_copies`, then adds a new `Borrow` row, all before one `commit()`. If you stripped that into separate, individually-committed operations — say, `commit()` right after the availability check, then a second `commit()` after inserting the borrow — here's specifically what breaks:
+
+- **The race condition from edge case #9 reopens.** Two requests could each independently read "1 copy available," both pass the check, both commit their own `Borrow` insert separately — because there's no longer one transaction boundary holding the read-then-write together, `with_for_update()`'s row lock has nothing to lock across, since the lock only holds for the duration of a single transaction.
+- **A crash between the two commits leaves permanently bad state.** If the process died, the network dropped, or an exception fired after the availability check's `commit()` but before the borrow-insert's `commit()`, you'd have no record of *why* the check happened — no rollback path recovers you, because the first `commit()` already made its results permanent and unrecoverable by definition.
+- **The `IntegrityError` handling from Day 15 stops working correctly.** Right now, an FK violation on the `Borrow` insert triggers `rollback()`, cleanly undoing everything since `BEGIN` — including the availability check's side effects, if it had any. Split into separate transactions, a failure partway through can't cleanly undo the already-committed first half; you'd need manual compensating logic (an explicit "undo" operation) to claw back to a consistent state, which is exactly the complexity transactions exist to make unnecessary.
+
+The general principle underneath all three: **a transaction's boundary should match the boundary of what "one action" means to your domain.** "Borrow a book" is one action to a library member — it either happens or it doesn't. The moment you split its steps across separate commits, you've quietly redefined "borrow a book" as two independent actions that merely tend to happen close together, and every guarantee from Day 7's ACID discussion stops applying to the thing you actually care about.
+
+---
+
+If any of the four sections above revealed a real gap — not just "I would have phrased it differently" but "I actually didn't understand this" — that's exactly what Week 3 review is for. Fix it now; Week 4 (auth, deployment, or wherever you take this next) will build directly on all of this being solid.
+
+Want to keep going — Day 18 into authentication and authorization, or pivot toward deployment (Docker, hosted Postgres, environment config for production)?
