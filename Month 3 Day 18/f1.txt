@@ -1,0 +1,87 @@
+Today marks a genuine paradigm shift — everything from Day 1 onward assumed relational thinking. MongoDB asks you to unlearn some of that on purpose.That right-hand box is the whole shift in one picture: instead of three tables joined together at query time, the borrow, the member's details, and the book's details all live inside **one self-contained document**. No `JOIN` needed to read it back — everything relevant is already there, physically together.
+
+## Document model vs relational — the key mental shift
+
+Everything you've built for 17 days assumed one rule: normalize data into separate tables, connect them with foreign keys, and reassemble them at query time with `JOIN`. MongoDB inverts that default. Its starting assumption is: **store together what you read together.**
+
+That's not "MongoDB is worse at relationships" — it's a genuinely different design question. In Postgres, the question was "what's the smallest non-redundant unit of truth, and how do I connect them?" In MongoDB, the question becomes "what shape does my application actually read and write as one unit, and can I store that shape directly?" A borrow record, its member's name and email, and its book's title are almost always read together and rarely need independent updates — so MongoDB lets you store them as one embedded document instead of three linked tables.
+
+The trade-off is real, not free: if a member's email changes, you now have to update it everywhere it's embedded (every borrow document that copied it in), rather than once in a single `members` row. Document databases trade update-time normalization discipline for read-time simplicity. Which one wins depends entirely on your actual read/write pattern — more on that below.
+
+## Collections, documents, fields — no schema enforced
+
+The vocabulary maps roughly like this, but the differences matter more than the similarities:
+
+| Relational | Document (MongoDB) |
+|---|---|
+| Table | Collection |
+| Row | Document |
+| Column | Field |
+
+The critical difference: **MongoDB does not require every document in a collection to have the same fields, or the same types for a shared field.** In Postgres, every row in `books` must have exactly the columns the table defines. In MongoDB, one document in a `books` collection could have a `cover_url` field and the next one could simply not have that field at all — no `NULL`, no error, it's just absent:
+
+```javascript
+// Both of these can coexist in the same "books" collection
+{ title: "Clean Code", author: "Robert Martin", isbn: "978-1" }
+{ title: "The Pragmatic Programmer", author: "Andy Hunt", isbn: "978-2", cover_url: "https://..." }
+```
+
+This is genuinely powerful for evolving, ragged data — but it means MongoDB won't catch a typo'd field name or a missing required field the way a `NOT NULL` constraint would. The database won't stop you from accidentally writing `{ titel: "..." }` instead of `{ title: "..." }` — that document silently exists with a field nobody will ever query correctly. (MongoDB does offer optional schema validation rules you can layer on top, but unlike Postgres, enforcement isn't the default — you have to opt into it deliberately.)
+
+## BSON types: ObjectId, Date, Array, embedded docs
+
+MongoDB stores documents as **BSON** (Binary JSON) — JSON's familiar structure, but with a richer, binary-encoded type system than plain JSON text supports:
+
+- **`ObjectId`** — MongoDB's default primary key type, auto-generated per document (the `_id` field). It's a 12-byte value encoding a timestamp, a machine/process identifier, and a counter — meaning, unlike Postgres's auto-incrementing integer PK, an `ObjectId` is roughly sortable by creation time and safe to generate independently on multiple machines without coordination (useful for distributed writes, where two servers generating sequential integers simultaneously would collide).
+- **`Date`** — a real datetime type, not a string — same underlying reason Day 8's `Mapped[date]` mattered: comparisons, sorting, and range queries all work correctly and don't depend on text formatting.
+- **`Array`** — a field can hold a list of values directly: `{ tags: ["fiction", "bestseller"] }`. There's no equivalent in a normalized relational table — you'd need a separate join table (exactly like `borrows` linking `members` and `books`) just to represent a list. MongoDB lets you skip that when the list is small and genuinely belongs to one document.
+- **Embedded documents** — a field's value can itself be a full nested document, not just a scalar: `{ member: { name: "Asha Rao", email: "asha@mail.com" } }`. This is the mechanism behind the diagram above — `member` isn't a foreign key pointing elsewhere, it's the actual data, physically nested inside the parent document.
+
+## When documents beat tables: activity logs, flexible schemas
+
+Two categories where the document model's trade-offs clearly win:
+
+**Activity/event logs.** Think "every action a user takes on the library site" — page views, searches, clicks. Each event might have wildly different fields (`search` events have a `query` string, `page_view` events have a `page_url`, `click` events have an `element_id`), the data is almost always read together as one event, almost never updated after being written, and the volume is huge and append-only. Forcing this into a rigid relational schema means either a table with dozens of mostly-`NULL` columns, or a maze of type-specific subtables — document storage just lets each event be its own natural shape.
+
+**Genuinely flexible, evolving schemas.** A product catalog where a book, a DVD, and a board game each have completely different relevant attributes (`page_count` vs `runtime_minutes` vs `player_count`) is awkward relationally — you'd need either one sparse table with every possible column, or per-category subtables joined back to a shared base table. In MongoDB, each product document just has whatever fields make sense for that product type, no schema migration required every time you add a new product category.
+
+**Where relational still clearly wins**, worth saying explicitly since this whole course has built the case for it: anything with strong cross-entity consistency requirements — money moving between accounts, inventory counts that must never go negative, anything needing the real multi-table ACID transactions from Day 7. Your Library API's `borrows` table, tightly coupled to `members` and `books` with FK constraints and availability checks, is actually a *worse* fit for pure document modeling than for what you've already built — that's not a coincidence, it's why you learned relational first.
+
+## Install MongoDB locally and open MongoDB Compass
+
+**macOS (Homebrew):**
+```bash
+brew tap mongodb/brew
+brew install mongodb-community
+brew services start mongodb-community
+```
+
+**Ubuntu/Debian:**
+```bash
+curl -fsSL https://pgp.mongodb.com/server-8.0.asc | sudo gpg --dearmor -o /usr/share/keyrings/mongodb.gpg
+echo "deb [signed-by=/usr/share/keyrings/mongodb.gpg] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/8.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb.list
+sudo apt update && sudo apt install mongodb-org
+sudo systemctl start mongod
+```
+
+**Windows:** download the MSI installer from mongodb.com, run it — it bundles MongoDB Compass by default.
+
+**Verify it's running:**
+```bash
+mongosh
+```
+
+```javascript
+show dbs
+use library_docs
+db.books.insertOne({ title: "Clean Code", author: "Robert Martin", isbn: "978-1" })
+db.books.find()
+```
+
+**MongoDB Compass** — the official GUI, separate download if it wasn't bundled (compass installer at mongodb.com/products/compass). Open it, connect to `mongodb://localhost:27017`, and you should see `library_docs` with your `books` collection and the one document you just inserted. Compass is worth having open for the next few days the same way `psql`/pgAdmin was for the SQL weeks — you'll want to visually confirm what's actually stored, especially early on while the schema-less model still feels unfamiliar.
+
+---
+
+**Practice for today**: insert three or four books into your `books` collection with deliberately inconsistent fields — give one a `cover_url`, skip it on another, add a `tags` array to a third — then browse them in Compass and notice that MongoDB doesn't complain about any of it. That's the whole mental shift, made concrete.
+
+Want Day 19 lined up? A natural next step is CRUD in MongoDB itself — `insertOne`/`insertMany`, `find()` with query operators, `updateOne`, `deleteOne`, and the query syntax differences from the SQL you already know cold.
