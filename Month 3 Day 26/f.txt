@@ -1,0 +1,51 @@
+This is a synthesis day — pulling together everything from Days 1–25 into a decision framework you could actually hand to a teammate. Let me find a few real engineering posts worth reading alongside your own draft.Today's less about new syntax and more about writing down, in your own words, the judgment you've actually built across 25 days — that's a different and harder skill than following a checklist someone else wrote.
+
+## Write your own 1-page decision guide: Postgres vs MongoDB
+
+Before reading anything below, draft this yourself — a genuine one-pager, not notes. Force yourself to write complete sentences you'd actually hand to a teammate making this call, not just a table of buzzwords. Then compare against the shape below, not to copy it, but to check whether your version reasons about trade-offs or just lists features.
+
+A reasonable structure, built from what you've actually lived through in this course rather than abstract theory:
+
+**Start with the question that actually matters**: not "which database is better" (Day 22 already taught you that's the wrong frame), but "what does *this specific data* need — and does that answer change if I ask about a different part of the same system?" Your own Library API answered this question twice, differently, in the same project: `books`/`members`/`borrows` needed one answer, `borrow_log` needed another.
+
+**Then the concrete deciding questions, each traceable to a specific day you lived through it:**
+
+- *Does this data have relationships that get queried from multiple directions?* (Day 4's `LEFT JOIN`, both "everything this member borrowed" and "everyone who's borrowed this book") → Postgres. A document model optimizes for one dominant access pattern; if you genuinely need several equally important ones, normalized tables with joins serve all of them without picking a favorite upfront.
+- *Does correctness depend on multiple pieces of data changing together, atomically, under concurrent access?* (Day 7's transactions, Day 15's `with_for_update()` row locking) → Postgres. This is the sharpest, least negotiable line — money, inventory counts, anything where "half-applied" is a real failure state.
+- *Is the schema itself going to change shape unpredictably, per-record, faster than you want to run migrations?* (Day 18's flexible-schema case, Day 12/13's migration discipline) → MongoDB. If you're writing an Alembic migration every week because the shape of the data keeps genuinely varying, that's the tell.
+- *Is this fundamentally an append-only stream, read in bulk, rarely updated after creation?* (Day 18/19's activity-log case, your actual `borrow_log`) → MongoDB. Logs, events, analytics snapshots — data where "this row means something different every time" is normal, not a modeling failure.
+- *Does the database itself need to catch bad data, even when application code has a bug?* (Day 17's defense-in-depth `CHECK` constraint) → Postgres, decisively. MongoDB's schema validation exists but isn't the default the way Postgres's constraints are — if you're relying on the database as a genuine safety net rather than just a container, that's a vote for Postgres.
+
+## Factors: schema flexibility, query complexity, relationships, scale
+
+| Factor | Postgres | MongoDB |
+|---|---|---|
+| **Schema flexibility** | Rigid by default (Day 1–2); flexible via `JSONB` columns if you need an escape hatch without leaving Postgres | Flexible by default (Day 18); can be locked down via `$jsonSchema` validation if you want structure back |
+| **Query complexity** | `JOIN`s across normalized tables handle arbitrary, unpredictable query shapes well (Day 4) | Aggregation pipelines (Day 21) handle known, designed-for access patterns very well; ad hoc cross-collection queries are more awkward without `$lookup` |
+| **Relationships** | First-class — FKs, constraints, join-based queries from any direction (Day 1, Day 9) | Modeled via embedding (fast reads, harder updates) or manual references (more like a join, but without FK enforcement) |
+| **Scale (writes)** | Vertical scaling is the default story; horizontal write scaling needs extensions (Citus) or careful sharding design | Horizontal sharding is a first-class, built-in feature — designed for it from the start |
+| **Scale (reads)** | Read replicas, indexing (Day 6) handle most read-heavy workloads well | Similarly strong via replica sets; document locality (Day 18) can mean fewer round trips per read |
+| **Data integrity guarantees** | Enforced at the database layer regardless of application bugs (Day 2, Day 17) | Historically weaker by default; has significantly closed the gap (multi-document transactions, schema validation) but isn't the default posture |
+
+**One thing worth flagging explicitly, since it'll change how you read the search results below**: this table itself is already slightly out of date the moment either database ships a new release. Both systems have spent real engineering effort borrowing each other's strengths — that convergence is a genuine, ongoing trend, not a footnote, which is exactly why the next section matters more than memorizing any single comparison table.
+
+## Read: 3 real engineering blog posts on this decisionTwo things worth reading for specifically, across all three:
+
+- **The convergence story is real, and it should make you distrust rigid rules.** Postgres has had solid `JSONB` support for years now — you can store schema-flexible data *inside* a Postgres table and get indexing on it (Day 6's lesson still applies to `JSONB` fields via `GIN` indexes). MongoDB has had multi-document ACID transactions since version 4.0. Neither database is now purely "the rigid one" or purely "the flexible one" — the honest framework isn't "Postgres = structured, Mongo = flexible," it's "which default posture and tooling ecosystem better fits how *this* data actually gets used."
+- **The hybrid pattern has a real anti-pattern version worth naming**, since it's easy to rationalize the wrong reason after the fact: reaching for MongoDB because "the frontend team knows JavaScript" or "we want to feel modern" — with a workload that's actually deeply relational — is choosing a database for team preference or trend, not for the data's actual shape. Your own Day 25 architecture is the *justified* version of the hybrid pattern specifically because the two databases hold genuinely different kinds of data with genuinely different consistency needs — not because MongoDB seemed more exciting to add.
+
+## Understand: most startups use both, for different things — like you're doing
+
+This is worth saying plainly rather than leaving implicit: the architecture you built across Days 15–25 — Postgres for `books`/`members`/`borrows`, MongoDB for `borrow_log` — is not a toy exercise invented for this course. It's a genuinely common production pattern, and now you understand *why* it's common rather than just having assembled it by following instructions.
+
+The reasoning holds up because it followed the data, not a trend:
+
+- `books`, `members`, `borrows` needed FK constraints, transactions, and multi-directional joins → that's a Postgres workload, full stop, argued from first principles across Days 1–17.
+- `borrow_log` needed to be append-only, denormalized for fast standalone reads, tolerant of an occasional missed write → that's a MongoDB workload, argued from first principles across Days 18–24.
+- Day 25's dual-write pattern, with Postgres as the acknowledged source of truth and MongoDB explicitly allowed to fail without blocking the main transaction, is exactly the kind of deliberate, reasoned trade-off the "anti-pattern" warning above is contrasting against. You can point to *why* each piece of data lives where it lives — that's the actual bar, not "using two databases makes the architecture more impressive."
+
+**The test worth applying to any future project, including ones far removed from a library API**: for each meaningfully distinct category of data your system handles, ask Day 26's five questions above independently. Don't pick one database for the whole project and force every kind of data into it. Some categories will clearly want Postgres, some will clearly want MongoDB, and — this is worth being honest about too — plenty of real systems are perfectly well served by *just* Postgres, using `JSONB` for the handful of fields that genuinely need schema flexibility, and never introducing a second database at all. Running two databases is a real operational cost (two things to monitor, back up, secure, keep available) — Day 25's "test the failure path" exercise wasn't incidental, it's the ongoing tax you pay for the flexibility. The right call is never "use both because you can," it's "use both because you traced the actual requirement, twice, and got two different honest answers."
+
+---
+
+That's the last review-style day of this arc — 26 days from "what is a relational database" through a working dual-database production architecture, with the judgment now to explain *why* each piece lives where it does, not just how to build it. Where would you like to go next — deployment (Docker Compose for both databases, environment config, a real hosted setup), or a different direction entirely?
