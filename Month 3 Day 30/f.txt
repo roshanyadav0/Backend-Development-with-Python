@@ -1,0 +1,108 @@
+This is the day everything from Weeks 2–3 quietly comes back to bite you if you don't know to look for it — the ORM's biggest hidden performance trap, and it's invisible until you actually count your queries.
+
+## What the N+1 query problem is — and why ORMs cause itLeft side is the trap, and it's genuinely easy to write without noticing:
+
+```python
+members = (await db.execute(select(Member))).scalars().all()
+for member in members:
+    print(member.name, len(member.borrows))   # each access fires a NEW query
+```
+
+That loop looks completely innocent — you already saw `member.borrows` used freely back on Day 9/10 as "just navigating the object graph." But under the hood, `relationship()` defaults to **lazy loading**: `member.borrows` isn't data that's already in memory, it's a promise to query for it *the first time you touch it*. Loop over 50 members and access `.borrows` on each one, and SQLAlchemy fires the initial `SELECT * FROM members` (1 query) plus 50 separate `SELECT * FROM borrows WHERE member_id = ?` (N queries) — 51 round trips to the database for what feels like one logical request.
+
+**Why ORMs specifically cause this, and why it's not a SQLAlchemy bug**: the ORM's whole value proposition (Day 9) is letting you write `member.borrows` and get a Python list back, hiding the query underneath. That convenience is exactly the danger — nothing in the syntax signals "this line just made a network round trip." In raw SQL, you'd never accidentally write 51 separate `SELECT` statements, because you'd have to type each one. The ORM's abstraction is what makes it invisible.
+
+## SQLAlchemy: selectinload() and joinedload()
+
+Both solve N+1 by telling SQLAlchemy upfront, at query time, "I'm going to need `.borrows` for every member — fetch it now, batched, not lazily one at a time later."
+
+```python
+from sqlalchemy.orm import selectinload, joinedload
+
+# selectinload — two separate queries, batched
+stmt = select(Member).options(selectinload(Member.borrows))
+members = (await db.execute(stmt)).scalars().all()
+
+for member in members:
+    print(member.name, len(member.borrows))   # no new query — already loaded
+```
+
+`selectinload` runs **exactly 2 queries total**, no matter how many members there are: one `SELECT * FROM members`, then one `SELECT * FROM borrows WHERE member_id IN (1, 2, 3, ...)` — batching every member's borrows into a single `IN` clause, matching the right diagram above precisely.
+
+```python
+# joinedload — a single query using a SQL JOIN
+stmt = select(Member).options(joinedload(Member.borrows))
+members = (await db.execute(stmt)).unique().scalars().all()
+```
+
+`joinedload` runs **1 query total**, using an actual `LEFT JOIN` under the hood — exactly the `LEFT JOIN` pattern from Day 4, generated for you. Notice the `.unique()` call, which isn't optional here: a `JOIN` produces one result row *per borrow*, so a member with 3 borrows appears 3 times in the raw joined rows — `.unique()` deduplicates back down to one `Member` object per member, with `borrows` correctly populated as a list.
+
+**When to reach for which**, since they're not interchangeable defaults:
+
+- **`selectinload`** is generally the safer default for one-to-many relationships (one member, many borrows) — it avoids the row-multiplication `joinedload` causes, and its second query is simple and cheap to reason about independently.
+- **`joinedload`** wins when the relationship is one-to-one or many-to-one (a `Borrow`'s single `member` and `book`, from Day 9) — no row multiplication risk there, and one query beats two.
+- Loading **multiple** relationships at once, mixing both is completely normal: `select(Borrow).options(joinedload(Borrow.member), joinedload(Borrow.book))` — both are many-to-one from `Borrow`'s side, so `joinedload` is a clean single-query fit for both simultaneously.
+
+## EXPLAIN ANALYZE on a slow query
+
+This ties directly back to Day 6 — the query count difference above isn't theoretical, you can watch it happen. With `echo=True` (Day 8) on your engine, the lazy-loading version literally prints 51 separate `SELECT` statements to your console as they fire, one per loop iteration — that's the fastest way to *see* N+1 happening rather than reason about it abstractly.
+
+For the actual cost difference, run `EXPLAIN ANALYZE` on the equivalent raw SQL for each approach:
+
+```sql
+-- The N+1 pattern's per-member query, run 50 times
+EXPLAIN ANALYZE SELECT * FROM borrows WHERE member_id = 7;
+-- Execution Time: 0.05 ms  ← looks fast in isolation...
+
+-- ...but 50 round trips each pay full network latency, not just query time
+-- 50 × (0.05ms query + ~1-5ms network round trip) adds up fast
+
+-- The selectinload equivalent — one batched query
+EXPLAIN ANALYZE SELECT * FROM borrows WHERE member_id IN (1,2,3,4,5,...,50);
+-- Execution Time: 0.3 ms  ← one round trip, not fifty
+```
+
+**The real cost of N+1 usually isn't query execution time at all — it's network round trips.** Each individual query might be genuinely fast in isolation (as `EXPLAIN ANALYZE` shows), but every one of those 50 queries still pays the full cost of a network hop to the database and back — that's the part `EXPLAIN ANALYZE` on a single query can't show you, since it only measures execution, not the round-trip overhead that dominates when you multiply by 50.
+
+## Add eager loading to GET /members/{id} with their borrows
+
+Putting it together in the actual route, tying back to every prior day's pieces:
+
+```python
+from sqlalchemy.orm import selectinload
+from sqlalchemy import select
+
+@app.get("/members/{member_id}", response_model=schemas.MemberWithBorrows)
+async def read_member(member_id: int, db: AsyncSession = Depends(get_db)):
+    stmt = (
+        select(Member)
+        .options(selectinload(Member.borrows).selectinload(Borrow.book))
+        .where(Member.member_id == member_id)
+    )
+    member = (await db.execute(stmt)).scalar_one_or_none()
+
+    if member is None:
+        raise HTTPException(status_code=404, detail="Member not found")
+
+    return member
+```
+
+Notice the **chained** `selectinload(Member.borrows).selectinload(Borrow.book)` — this is eager-loading two levels deep in one statement: members → their borrows → each borrow's book. Without the second `.selectinload()`, accessing `borrow.book.title` inside your Pydantic serialization would itself trigger a fresh N+1 problem, one level further down — the exact same trap, just one relationship hop later. Eager loading has to be applied at every level your response actually touches, not just the first one.
+
+```python
+# schemas.py
+class MemberWithBorrows(BaseModel):
+    member_id: int
+    name: str
+    email: str
+    borrows: list[BorrowRead]
+    model_config = {"from_attributes": True}
+```
+
+**Verify it actually worked, don't just trust that it did** — turn on `echo=True` and hit this endpoint, then count the printed `SELECT` statements: it should be exactly 3 (members, borrows, books), regardless of how many borrows that member has. If you see one query per borrow instead, the eager-load chain is missing a level somewhere.
+
+---
+
+**Practice for today**: seed a member with 10+ borrows, then write the *same* endpoint two ways — once with plain lazy `member.borrows` access, once with the chained `selectinload` above — turn `echo=True` on for both, and count the actual printed queries side by side. That side-by-side count, not a description of the concept, is what makes N+1 permanently recognizable in code you write from now on.
+
+That closes Month 3's technical arc — from raw SQL through async ORMs, dual databases, resilience, and now the performance trap almost every ORM user hits at least once in production before someone shows them this. Where would you like to go from here?
