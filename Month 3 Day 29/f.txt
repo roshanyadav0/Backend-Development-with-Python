@@ -1,0 +1,40 @@
+Month 3 review, but more honest than the weekly ones — this time you diagnose your own gaps first, rather than working through a pre-set list.
+
+## What was hardest this month? Redo those exercises
+
+Before anything else, actually answer this for yourself — not generically, specifically. Go back through Days 18–28 and identify the one or two moments where you genuinely hesitated, not just where you made a typo. Common candidates worth checking honestly against your own experience:
+
+- **The `$set` footgun (Day 19)** — did you actually trigger the silent full-document replacement once, on purpose, or did you just read about it? If you never watched it happen, that's worth doing now — it's the kind of mistake that's obvious in retrospect and invisible in advance.
+- **`$match` before vs after `$group` (Day 21)** — the "most recently active member" pipeline from Day 22's review (requiring `$sort` *before* `$group`, inverting the usual instinct) is a genuinely good gut-check. If you had to think hard about that one, redo it cold, no notes.
+- **The dual-write failure path (Day 25/27)** — did you actually stop MongoDB and confirm Postgres still succeeds, or did you only test the happy path? This is the single most skippable exercise in the whole month, because the happy path is more satisfying to watch work — which is exactly why it's worth deliberately going back to.
+- **Retry logic vs idempotency (Day 27)** — can you explain, without notes, *why* retrying a non-idempotent operation is dangerous, using your own `create_borrow()` as the concrete example? If that connection feels fuzzy, that's the one to redo.
+
+Pick whichever of these (or your own honest candidate) actually gave you trouble, and rebuild that specific exercise from scratch before moving on — a review month is wasted if it re-confirms what you already knew instead of shoring up what you didn't.
+
+## Write: explain transactions and why they matter, without googling
+
+Actually write this — a few paragraphs, no reference material, as if explaining to someone who's never heard of ACID. Then self-check against this rubric rather than a model answer, since the value here is in *your* explanation, not a copy of mine:
+
+- Did you explain **why** atomicity matters using a concrete example (your own `create_borrow()`, not an abstract "bank transfer" you memorized from a textbook)?
+- Did you distinguish what happens **without** a transaction — specifically, what partial state becomes possible — not just assert that transactions "prevent problems"?
+- Did you mention isolation as a *separate* concern from atomicity? A lot of people conflate the two; they solve different problems (atomicity: does this operation happen completely or not at all; isolation: can concurrent operations see each other's half-finished work).
+- Could you explain `READ COMMITTED` vs `SERIALIZABLE` in one sentence each, with the last-copy race condition from Day 7 as the motivating example?
+
+If your explanation could be given by someone who'd only read the words "ACID" and "BEGIN/COMMIT/ROLLBACK" without ever running the Day 7 practice exercise, it's not grounded enough yet — go back and re-run that exercise, then rewrite the explanation.
+
+## Write: explain the aggregation pipeline to a junior dev
+
+Same rule — actually write it, no notes. Self-check:
+
+- Did you lead with the **stage-by-stage data flow** mental model (Day 21's diagram) rather than jumping straight to `$match`/`$group` syntax? A junior dev needs the shape of the idea before the specific operators.
+- Did you explain the `$match`-before-`$group` vs `$match`-after-`$group` distinction explicitly, using the `WHERE` vs `HAVING` parallel from SQL? This is the single most useful bridge for someone coming from SQL, and the easiest thing to leave out if you're rushing.
+- Did you give at least one concrete example pipeline, not just abstract stage names?
+- Would a junior dev, after reading your explanation, know *why* `$match` should generally go as early as possible — tying back to Day 6's indexing lesson (an early `$match` can use an index; a late one can't)?
+
+## Ask Claude to quiz you on indexes, ACID, and MotorTake the quiz above — it's deliberately weighted toward the reasoning behind each concept rather than pure recall, since that's the part that actually breaks down under real pressure six months from now, not the syntax.
+
+If you miss any of q3/q4 (isolation) or q7 (idempotency), that's a strong signal to go re-run the actual Day 7 or Day 27 practice exercises hands-on rather than just re-reading the explanation — for this kind of material, watching the failure happen once teaches more than a correct multiple-choice answer does.
+
+---
+
+Once you've done the writing exercises and the quiz honestly, Month 3 is genuinely closed out. Where would you like to go next — a Month 4 direction (deployment, auth, or something else), or do you want to spend another day specifically on whatever the quiz or the writing exercises exposed as still shaky?
