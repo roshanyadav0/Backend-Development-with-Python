@@ -1,0 +1,81 @@
+I'll create a comprehensive guide on authentication fundamentals for Day 1. Let me start with visual flows showing both approaches, then break down why JWTs became the standard.## The Core Difference
+
+**Session auth** is stateful: the server keeps a table. You log in → server creates a session → stores it in memory/database → sends the session ID back in a cookie → browser auto-sends it with every request.
+
+**Token auth** is stateless: the server creates a signed token containing your user data → sends it to you → you send it back with every request → server verifies the signature without needing to look anything up.
+
+## Why JWTs Won for APIs and SPAs
+
+### The scaling problem with sessions
+If you have three servers handling requests, and I store session data on Server A, what happens when my next request lands on Server B? Either:
+- Sticky sessions (route me back to A) — breaks load balancing
+- Replicate sessions across servers — expensive, complex, eventual-consistency bugs
+- Use a shared session store (Redis) — adds another moving part, another point of failure
+
+### Why tokens solve this
+A JWT is self-contained proof. The server signs it with a secret, and any server holding that secret can verify it in microseconds without a database lookup. No state to sync, no "where was that session stored" problem.
+
+### Why SPAs adopted JWTs specifically
+- **No cookie restrictions**: tokens live in localStorage/sessionStorage or memory, bypassing cookie domain policies
+- **Cross-origin requests**: APIs running on different domains can validate the same token
+- **Mobile-friendly**: native apps have no cookie concept; tokens are transport-agnostic
+- **Microservices**: if you have 10 backend services, they all trust the same signed token without needing a shared session store
+
+## What a JWT Looks Like
+
+```
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.
+eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.
+SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c
+```
+
+**Three parts separated by dots:**
+
+1. **Header** (base64-decoded):
+   ```json
+   { "alg": "HS256", "typ": "JWT" }
+   ```
+   Tells you *how* it's signed (HMAC with SHA-256).
+
+2. **Payload** (base64-decoded):
+   ```json
+   { "sub": "1234567890", "name": "John Doe", "iat": 1516239022 }
+   ```
+   The actual data — user ID, name, when it was issued. **This is readable, not secret.**
+
+3. **Signature**:
+   ```
+   HMAC(
+     secret,
+     base64(header) + "." + base64(payload)
+   )
+   ```
+   Proves the token hasn't been tampered with. Only the server knows the secret.
+
+## Verify It Yourself: jwt.io
+
+Go to [jwt.io](https://jwt.io) and paste the token above. You'll see:
+- The **decoded header and payload** (plain text, anyone can read)
+- The **signature verification** — paste in the secret `your-256-bit-secret`, and it shows ✓ "Signature Verified"
+- If you *change one character* in the payload, the signature breaks
+
+## The Critical Truth About JWTs
+
+**JWTs are signed, not encrypted.**
+
+- **Signed** = tamper-proof. You can't change the payload without invalidating the signature.
+- **Encrypted** = secret. Nobody can read it.
+
+A JWT is the opposite: everybody can read it (it's base64, trivial to decode), but only the server can *modify* it. If your payload contains `{ "isAdmin": true }`, anyone can *read* that you're an admin. They just can't *forge* it because they don't have the signing secret.
+
+**Never put passwords, credit cards, or tokens-inside-tokens in a JWT.** Put identifiers (user ID, org ID, roles) — things safe to be visible. If you need to hide data, encrypt the whole JWT (JWE — JSON Web Encryption) or use a session ID + server storage.
+
+## Key Takeaways for Day 1
+
+1. **Sessions** = server stores user data, cookie carries a reference ID
+2. **Tokens** = server signs user data, client carries the signed token
+3. **JWTs** = a standard way to structure and sign tokens (header.payload.signature)
+4. **Why JWTs won** = stateless scaling, cross-origin friendly, perfect for SPAs and APIs
+5. **Signed ≠ Encrypted** = a JWT proves nobody changed it, but everyone can *read* it
+
+Ready for Day 2? You'll learn how to issue JWTs safely, set expiration, handle refresh tokens, and avoid common pitfalls.
