@@ -1,0 +1,33 @@
+# Day 11: Google OAuth - Python Requirements
+
+# Web Framework
+fastapi==0.104.1
+uvicorn==0.24.0
+python-multipart==0.0.6
+
+# HTTP Client (for backend OAuth requests)
+httpx==0.25.1
+
+# Data Validation
+pydantic==2.5.0
+
+# Environment Variables
+python-dotenv==1.0.0
+
+# JWT (for ID token decoding)
+PyJWT==2.8.1
+
+# Testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+
+# Optional: Database (if not using mock)
+# sqlalchemy==2.0.23
+# psycopg2-binary==2.9.9  # PostgreSQL
+# pymongo==4.6.0  # MongoDB
+
+# Optional: Security
+# cryptography==41.0.7
+# passlib==1.7.4
+# python-jose==3.3.0
