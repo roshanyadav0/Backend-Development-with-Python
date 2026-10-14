@@ -1,0 +1,107 @@
+# Day 1: Django Hello World
+
+## Setup
+
+Use a virtual environment so Django doesn't get installed system-wide:
+
+```bash
+mkdir blog_platform_project && cd blog_platform_project
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+pip install django
+django-admin startproject blog_platform .
+python manage.py startapp posts
+python manage.py runserver
+```
+
+Note the trailing `.` in `startproject`. It creates the project in the current folder instead of nesting an extra directory.
+
+Open http://127.0.0.1:8000/ and you should see the rocket welcome page.
+
+## Resulting structure
+
+```
+blog_platform_project/
+├── manage.py
+├── blog_platform/          # the project (config package)
+│   ├── __init__.py
+│   ├── settings.py
+│   ├── urls.py
+│   ├── asgi.py
+│   └── wsgi.py
+└── posts/                  # an app
+    ├── migrations/
+    ├── admin.py
+    ├── apps.py
+    ├── models.py
+    ├── tests.py
+    └── views.py
+```
+
+## Project vs app vs manage.py
+
+**Project** (`blog_platform/`) is the whole website's configuration. It holds `settings.py` (database, installed apps, middleware, etc.) and the root `urls.py`. There is one project per site.
+
+**App** (`posts/`) is a self-contained feature with its own models, views, and templates. A site is made of many apps (posts, users, comments). A good app does one thing and could in theory be reused in another project.
+
+**manage.py** is a thin command-line wrapper around `django-admin` that is pre-configured to use your project's settings. You'll use it constantly: `runserver`, `makemigrations`, `migrate`, `createsuperuser`, `shell`, `test`.
+
+Mental model: the project is the building, apps are the rooms, `manage.py` is the control panel.
+
+## Important: creating an app doesn't activate it
+
+Add it to `INSTALLED_APPS` in `blog_platform/settings.py`:
+
+```python
+INSTALLED_APPS = [
+    "django.contrib.admin",
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.messages",
+    "django.contrib.staticfiles",
+    "posts",   # add this
+]
+```
+
+## Stretch: your own "Hello, world" page
+
+Replace the rocket page with something you wrote.
+
+**posts/views.py**
+```python
+from django.http import HttpResponse
+
+def hello(request):
+    return HttpResponse("Hello, world! This is my blog platform.")
+```
+
+**blog_platform/urls.py**
+```python
+from django.contrib import admin
+from django.urls import path
+from posts.views import hello
+
+urlpatterns = [
+    path("admin/", admin.site.urls),
+    path("", hello),
+]
+```
+
+Refresh the browser and you'll see your message. This is the core Django loop: **URL → view → response**.
+
+## Day 1 checklist
+
+- [ ] Virtual environment created and activated
+- [ ] Welcome page visible at port 8000
+- [ ] Can explain project vs app vs `manage.py` in one sentence each
+- [ ] `posts` added to `INSTALLED_APPS`
+- [ ] Custom hello view working
+
+## Common gotchas
+
+- **`django-admin: command not found`**: your venv isn't activated.
+- **Port already in use**: run `python manage.py runserver 8001`.
+- **You'll see a "17 unapplied migrations" warning**: harmless for now. Day 2 or 3 you'll run `python manage.py migrate`.
+
+Next up (Day 2) is typically models and migrations: defining a `Post` model and creating its database table. Want me to outline that too?
