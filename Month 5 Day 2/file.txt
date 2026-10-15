@@ -1,0 +1,193 @@
+# Day 2: Django Settings & URLs
+
+## Part 1: Understanding settings.py
+
+Open `blog_platform/settings.py`. Three settings matter most today.
+
+### INSTALLED_APPS
+The list of apps Django loads. Django uses it to find models (for migrations), templates, static files, admin registrations, and management commands. If an app isn't listed, Django ignores it.
+
+```python
+INSTALLED_APPS = [
+    "django.contrib.admin",        # built-in apps
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.messages",
+    "django.contrib.staticfiles",
+    "posts",                       # your app
+]
+```
+
+### DATABASES
+Defaults to SQLite, a single file in your project root. Zero setup, perfect for learning.
+
+```python
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME": BASE_DIR / "db.sqlite3",
+    }
+}
+```
+
+To switch to PostgreSQL later, you only change this block (plus install `psycopg`). Your models and views stay the same, which is the point of the ORM.
+
+### STATIC_URL
+The URL prefix for static files (CSS, JS, images).
+
+```python
+STATIC_URL = "static/"
+```
+
+A file at `posts/static/posts/style.css` is served at `/static/posts/style.css` during development. You'll use this properly when you add templates.
+
+## Part 2: Function-based views
+
+A view is just a function that takes a `request` and returns a `response`.
+
+**posts/views.py**
+```python
+from django.http import HttpResponse
+
+def home(request):
+    return HttpResponse("Welcome to the blog platform.")
+
+def post_list(request):
+    return HttpResponse("This will list all posts.")
+
+def post_detail(request, post_id):
+    return HttpResponse(f"You are viewing post #{post_id}.")
+```
+
+`post_detail` receives `post_id` from the URL. That's the next step.
+
+## Part 3: The URL dispatcher
+
+Django matches the requested path against `urlpatterns` from top to bottom and calls the first matching view.
+
+### Step 1: Create posts/urls.py
+Django does not generate this file, so create it yourself:
+
+```python
+from django.urls import path
+from . import views
+
+app_name = "posts"
+
+urlpatterns = [
+    path("", views.post_list, name="list"),
+    path("<int:post_id>/", views.post_detail, name="detail"),
+]
+```
+
+- `<int:post_id>` is a **path converter**. It matches digits only and passes the value to the view as an integer. Others: `str`, `slug`, `uuid`.
+- `name=` lets you refer to a URL without hardcoding it (via `reverse()` or `{% url %}` in templates).
+- `app_name` namespaces the names, so you'll write `posts:detail`.
+
+### Step 2: Include it from the project urls
+
+**blog_platform/urls.py**
+```python
+from django.contrib import admin
+from django.urls import path, include
+from posts import views as posts_views
+
+urlpatterns = [
+    path("admin/", admin.site.urls),
+    path("posts/", include("posts.urls")),
+    path("", posts_views.home, name="home"),
+]
+```
+
+`include()` hands off everything after the matched prefix to the app's own urls. So:
+
+| URL | Matched by | View |
+|---|---|---|
+| `/` | project urls | `home` |
+| `/posts/` | project → `""` in app | `post_list` |
+| `/posts/42/` | project → `<int:post_id>/` in app | `post_detail(request, 42)` |
+| `/posts/abc/` | nothing | 404 |
+
+Why this matters: each app owns its URLs, so the project file stays small and apps stay reusable.
+
+## Part 4: The request/response cycle
+
+```
+   Browser
+      │  GET /posts/42/
+      ▼
+┌───────────────────────┐
+│  Web server           │   (runserver in dev; gunicorn/nginx in prod)
+│  (WSGI / ASGI)        │
+└──────────┬────────────┘
+           ▼
+┌───────────────────────┐
+│  Middleware (request) │   security, sessions, auth, CSRF...
+└──────────┬────────────┘
+           ▼
+┌───────────────────────┐
+│  URL dispatcher       │   ROOT_URLCONF → blog_platform/urls.py
+│  (urls.py)            │   matches "posts/" → posts/urls.py → "<int:post_id>/"
+└──────────┬────────────┘
+           ▼
+┌───────────────────────┐
+│  View                 │   post_detail(request, post_id=42)
+│  (views.py)           │   ↕ talks to models/database (Day 3)
+│                       │   ↕ renders a template (later)
+└──────────┬────────────┘
+           ▼
+┌───────────────────────┐
+│  Middleware (response)│   runs in reverse order
+└──────────┬────────────┘
+           ▼
+   HttpResponse → Browser
+```
+
+**Your exercise:** draw this by hand on paper without looking. Then annotate each box with the file where it lives in your project. Being able to redraw it from memory is the real goal of today.
+
+## Part 5: Try it
+
+```bash
+python manage.py runserver
+```
+
+Visit:
+- http://127.0.0.1:8000/
+- http://127.0.0.1:8000/posts/
+- http://127.0.0.1:8000/posts/7/
+- http://127.0.0.1:8000/posts/abc/ (expect a 404; with `DEBUG = True` you'll see a helpful page listing which patterns were tried)
+
+## Stretch: use reverse()
+
+In the Django shell, see how `name=` pays off:
+
+```bash
+python manage.py shell
+```
+```python
+>>> from django.urls import reverse
+>>> reverse("posts:detail", args=[42])
+'/posts/42/'
+```
+
+If you later change `posts/` to `blog/` in the project urls, `reverse()` follows automatically and nothing else breaks.
+
+## Day 2 checklist
+
+- [ ] Can explain what `INSTALLED_APPS`, `DATABASES`, and `STATIC_URL` each do
+- [ ] Three function-based views written
+- [ ] `posts/urls.py` created with `app_name`
+- [ ] Included in project urls via `include()`
+- [ ] `/posts/<int>/` passes the id into the view
+- [ ] Request/response diagram drawn from memory
+- [ ] `reverse()` tried in the shell
+
+## Common gotchas
+
+- **Missing trailing slash**: Django's `APPEND_SLASH` setting redirects `/posts` to `/posts/`, but write your patterns with the slash.
+- **`ModuleNotFoundError: posts.urls`**: you forgot to create `posts/urls.py`.
+- **Pattern order matters**: put specific patterns before broad ones, since the first match wins.
+- **Forgot the comma** between `path()` entries: gives a confusing syntax error.
+
+Day 3 is where the blog gets real: the `Post` model, migrations, and the admin. Want that outline next?
