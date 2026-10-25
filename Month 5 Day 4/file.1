@@ -1,0 +1,287 @@
+# Day 4: Django ORM, Queries
+
+## Part 1: QuerySets are lazy
+
+A QuerySet describes a query but doesn't hit the database until you evaluate it (iterate, slice with a step, `list()`, `len()`, `bool()`, `print`, etc.). That's why chaining is cheap:
+
+```python
+qs = Post.objects.filter(title__icontains="django")   # no query yet
+qs = qs.exclude(author__username="bob")               # still no query
+qs = qs.order_by("-created_at")                       # still no query
+for post in qs:                                       # query runs here
+    print(post)
+```
+
+QuerySets also cache their results after the first evaluation, so iterating the same `qs` twice runs one query.
+
+## Part 2: Core QuerySet API
+
+```python
+Post.objects.all()                          # everything
+Post.objects.filter(author=alice)           # WHERE author_id = ...
+Post.objects.exclude(author=alice)          # WHERE NOT (...)
+Post.objects.order_by("title")              # ascending
+Post.objects.order_by("-created_at")        # descending
+Post.objects.order_by("author__username", "-created_at")   # multiple keys
+Post.objects.first()                        # first by ordering, or None
+Post.objects.last()                         # last, or None
+Post.objects.get(slug="my-first-post")      # exactly one, else exception
+Post.objects.count()
+Post.objects.exists()                       # cheaper than count() > 0
+Post.objects.values("title", "slug")        # dicts instead of model instances
+Post.objects.values_list("title", flat=True)
+Post.objects.distinct()
+Post.objects.all()[:5]                      # LIMIT 5
+```
+
+### Field lookups (double underscore)
+
+| Lookup | Meaning |
+|---|---|
+| `title__exact="x"` | equals (the default) |
+| `title__iexact="x"` | case-insensitive equals |
+| `title__contains="x"` / `icontains` | substring |
+| `title__startswith="x"` | prefix |
+| `id__in=[1, 2, 3]` | in list |
+| `created_at__gte=date` | greater than or equal (`gt`, `lt`, `lte`) |
+| `created_at__year=2026` | date part |
+| `updated_at__isnull=False` | null check |
+
+### Spanning relationships
+
+The same `__` syntax follows foreign keys and M2M, forwards and backwards:
+
+```python
+Post.objects.filter(author__username="alice")
+Post.objects.filter(categories__slug="django")
+Category.objects.filter(posts__title__icontains="orm")    # reverse via related_name
+Post.objects.filter(comments__body__icontains="great").distinct()
+```
+
+Note the `.distinct()` on the last one: joining across a one-to-many can return the same post multiple times.
+
+## Part 3: Q objects for OR (and NOT)
+
+Keyword arguments in `filter()` are always ANDed. For OR, use `Q`:
+
+```python
+from django.db.models import Q
+
+# OR
+Post.objects.filter(Q(title__icontains="django") | Q(body__icontains="django"))
+
+# AND (same as normal kwargs, but composable)
+Post.objects.filter(Q(author=alice) & Q(title__icontains="first"))
+
+# NOT
+Post.objects.filter(~Q(author=alice))
+
+# Mixed: (title OR body matches) AND by alice
+Post.objects.filter(
+    Q(title__icontains="django") | Q(body__icontains="django"),
+    author=alice,
+)
+```
+
+**Rule:** positional `Q` arguments must come before keyword arguments.
+
+A search function you'll reuse later:
+
+```python
+def search_posts(term):
+    return Post.objects.filter(
+        Q(title__icontains=term)
+        | Q(body__icontains=term)
+        | Q(categories__name__icontains=term)
+    ).distinct()
+```
+
+## Part 4: The N+1 problem and `select_related`
+
+Without optimization, this code is slow:
+
+```python
+for post in Post.objects.all():
+    print(post.title, post.author.username)   # one extra query per post
+```
+
+That's 1 query for the posts plus N queries for the authors. Hence "N+1".
+
+**`select_related`** does a SQL JOIN and loads the related object in the same query. Use it for **ForeignKey and OneToOne** (single-valued relations):
+
+```python
+for post in Post.objects.select_related("author"):
+    print(post.title, post.author.username)   # 1 query total
+```
+
+Chain through relations: `Comment.objects.select_related("post__author")`.
+
+This is Django's equivalent of SQLAlchemy's `joinedload`, as you noted.
+
+## Part 5: `prefetch_related` for many-valued relations
+
+JOINs on to-many relations would multiply rows, so `prefetch_related` runs a **separate query** and stitches results together in Python. Use it for **ManyToMany and reverse ForeignKeys**:
+
+```python
+# 2 queries total: posts, then all their categories
+for post in Post.objects.prefetch_related("categories"):
+    print(post.title, [c.name for c in post.categories.all()])
+
+# Reverse FK
+Post.objects.prefetch_related("comments")
+```
+
+Combine both:
+
+```python
+posts = (
+    Post.objects
+    .select_related("author")
+    .prefetch_related("categories", "comments__author")
+)
+```
+
+This is closer to SQLAlchemy's `selectinload` than `joinedload`.
+
+### Gotcha: prefetch is bypassed if you filter afterward
+
+```python
+post.comments.all()                       # uses the prefetched data
+post.comments.filter(body__icontains="x") # NEW query, ignores the prefetch
+```
+
+To filter inside a prefetch, use `Prefetch`:
+
+```python
+from django.db.models import Prefetch
+
+Post.objects.prefetch_related(
+    Prefetch("comments", queryset=Comment.objects.filter(body__icontains="great"))
+)
+```
+
+## Part 6: Measuring queries
+
+Don't guess; count.
+
+```python
+from django.db import connection, reset_queries
+from django.test.utils import CaptureQueriesContext
+
+with CaptureQueriesContext(connection) as ctx:
+    for post in Post.objects.all():
+        post.author.username
+print(len(ctx.captured_queries))     # N+1
+
+with CaptureQueriesContext(connection) as ctx:
+    for post in Post.objects.select_related("author"):
+        post.author.username
+print(len(ctx.captured_queries))     # 1
+```
+
+You can also print the SQL of any QuerySet: `print(qs.query)`.
+
+## Part 7: Practice, 10 queries
+
+First seed some data so the queries have something to find:
+
+```python
+from django.contrib.auth import get_user_model
+from posts.models import Post, Comment, Category, Like
+
+User = get_user_model()
+bob = User.objects.create_user("bob", password="pass12345")
+alice = User.objects.get(username="alice")
+django_cat = Category.objects.get(slug="django")
+python_cat = Category.objects.get(slug="python")
+
+p2 = Post.objects.create(author=bob, title="Django ORM tips", slug="orm-tips", body="select_related is great")
+p3 = Post.objects.create(author=alice, title="Python tricks", slug="py-tricks", body="List comprehensions rock")
+p2.categories.add(django_cat)
+p3.categories.add(python_cat)
+Comment.objects.create(post=p2, author=alice, body="Great tips!")
+Like.objects.create(post=p2, user=alice)
+Like.objects.create(post=p2, user=bob)
+```
+
+Now write each of these yourself before checking:
+
+1. All posts by `alice`, newest first.
+2. All posts **not** by `bob`.
+3. Posts whose title contains "django" (case-insensitive).
+4. Posts where the title **or** body contains "great".
+5. The most recently created post (`first()` with ordering).
+6. Posts in the "django" category.
+7. Posts that have at least one comment (hint: `comments__isnull=False`, plus `distinct()`).
+8. All posts with their authors, in **one** query (`select_related`).
+9. All posts with their categories, in **two** queries (`prefetch_related`).
+10. Titles only, as a flat list (`values_list`).
+
+<details>
+<summary>Answers</summary>
+
+```python
+# 1
+Post.objects.filter(author=alice).order_by("-created_at")
+
+# 2
+Post.objects.exclude(author=bob)
+
+# 3
+Post.objects.filter(title__icontains="django")
+
+# 4
+Post.objects.filter(Q(title__icontains="great") | Q(body__icontains="great"))
+
+# 5
+Post.objects.order_by("-created_at").first()
+
+# 6
+Post.objects.filter(categories__slug="django")
+
+# 7
+Post.objects.filter(comments__isnull=False).distinct()
+
+# 8
+list(Post.objects.select_related("author"))
+
+# 9
+list(Post.objects.prefetch_related("categories"))
+
+# 10
+list(Post.objects.values_list("title", flat=True))
+```
+</details>
+
+## Stretch: aggregation preview
+
+Counting likes per post without N+1 (this comes up constantly):
+
+```python
+from django.db.models import Count
+
+posts = Post.objects.annotate(like_count=Count("likes")).order_by("-like_count")
+for p in posts:
+    print(p.title, p.like_count)
+```
+
+`annotate` adds a computed column to each row, computed in SQL.
+
+## Day 4 checklist
+
+- [ ] Can explain why QuerySets are lazy
+- [ ] Used `filter`, `exclude`, `order_by`, `first`, `exists`
+- [ ] Wrote an OR query with `Q`, and a NOT query with `~Q`
+- [ ] Reproduced an N+1 and fixed it, confirmed with `CaptureQueriesContext`
+- [ ] Know which to use: `select_related` (FK/OneToOne) vs `prefetch_related` (M2M/reverse FK)
+- [ ] Completed all 10 practice queries
+
+## Common gotchas
+
+- **Duplicates after filtering across a relation**: add `.distinct()`.
+- **`get()` vs `filter()`**: `get()` raises if 0 or 2+ results; `filter()` returns a QuerySet.
+- **`first()` with no ordering** orders by primary key. Set `Meta.ordering` or call `order_by` explicitly if you want something specific.
+- **Calling `len(qs)` or `bool(qs)` just to check emptiness** loads everything. Use `.exists()` or `.count()`.
+- **Chained `filter()` on multi-valued relations** can behave differently from a single `filter()` with multiple conditions. `filter(a, b)` requires one related row to match both; `filter(a).filter(b)` allows different related rows.
+
+Day 5 is typically the Django admin: registering models, `list_display`, `search_fields`, and inlines. Want that outline next?
