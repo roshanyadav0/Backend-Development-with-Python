@@ -1,0 +1,168 @@
+# Day 6: Review Week 1
+
+Today is retrieval practice. The rule: **close the earlier days' notes, write from memory, then check.** Struggling is the point; that's what makes it stick.
+
+## Part 1: Rebuild Post and Comment from scratch (30 min)
+
+Delete nothing. Create a scratch app so you can't peek at your real code:
+
+```bash
+python manage.py startapp scratch
+```
+
+Add `scratch` to `INSTALLED_APPS`, then write these models in `scratch/models.py` with no notes:
+
+**Requirements**
+- `Post`: author (FK to user), title, slug (unique), body, status with choices (draft/published), `published_at` (nullable), created/updated timestamps, default ordering newest first, `__str__`
+- `Comment`: FK to post with a `related_name`, FK to author, body, created timestamp, ordering oldest first, `__str__`
+
+Then run `makemigrations` and `migrate`.
+
+**Self-check rubric** (tick each without looking):
+
+- [ ] Used `settings.AUTH_USER_MODEL`, not a direct `User` import
+- [ ] Every `ForeignKey` has `on_delete`
+- [ ] `CharField` has `max_length`
+- [ ] `related_name` set on both FKs of `Comment`
+- [ ] `auto_now_add` vs `auto_now` used correctly
+- [ ] `null=True, blank=True` on `published_at` (both are needed for a nullable date field)
+- [ ] `choices` defined via `TextChoices`
+- [ ] `Meta.ordering` present
+- [ ] `__str__` on both
+
+Two or more unticked boxes means re-read Day 3 and rebuild again tomorrow. Once done, remove the scratch app (delete the folder, remove it from `INSTALLED_APPS`) so it doesn't clutter your project.
+
+## Part 2: 10 ORM queries, new set (30 min)
+
+These are different from Day 4's, so you can't just recall answers. Use the Day 3/5 data, and add more rows if needed.
+
+1. Published posts by `alice`, newest first.
+2. Posts that are **drafts or** have no categories.
+3. Posts whose title or body contains "orm" and that were created this year.
+4. The 5 most recent comments, with each comment's post and author loaded in **one** query.
+5. All posts with authors (one query) and categories (one extra query).
+6. Posts that have **no** comments.
+7. Posts with their like count, ordered by most liked.
+8. Usernames of everyone who has commented on any post, no duplicates.
+9. For each category, the number of published posts in it.
+10. All posts, but each post's `comments` prefetch contains only comments containing "great".
+
+<details>
+<summary>Answers</summary>
+
+```python
+from django.db.models import Q, Count, Prefetch
+from django.utils import timezone
+from django.contrib.auth import get_user_model
+from posts.models import Post, Comment, Category
+
+User = get_user_model()
+alice = User.objects.get(username="alice")
+
+# 1
+Post.objects.filter(author=alice, status=Post.Status.PUBLISHED).order_by("-created_at")
+
+# 2
+Post.objects.filter(Q(status=Post.Status.DRAFT) | Q(categories__isnull=True)).distinct()
+
+# 3
+Post.objects.filter(
+    Q(title__icontains="orm") | Q(body__icontains="orm"),
+    created_at__year=timezone.now().year,
+)
+
+# 4
+Comment.objects.select_related("post", "author").order_by("-created_at")[:5]
+
+# 5
+Post.objects.select_related("author").prefetch_related("categories")
+
+# 6
+Post.objects.filter(comments__isnull=True)
+# or: Post.objects.annotate(n=Count("comments")).filter(n=0)
+
+# 7
+Post.objects.annotate(like_count=Count("likes")).order_by("-like_count")
+
+# 8
+User.objects.filter(comments__isnull=False).distinct().values_list("username", flat=True)
+
+# 9
+Category.objects.annotate(
+    published_count=Count("posts", filter=Q(posts__status=Post.Status.PUBLISHED))
+)
+
+# 10
+Post.objects.prefetch_related(
+    Prefetch("comments", queryset=Comment.objects.filter(body__icontains="great"))
+)
+```
+</details>
+
+Query 9 uses `Count(..., filter=Q(...))`, a conditional aggregate that is new today. If it surprised you, that's a good thing to note down.
+
+Scoring: 8 or more without peeking is solid. Below 6, redo Day 4 Parts 3 to 5.
+
+## Part 3: Admin fluency check (20 min)
+
+Without looking at Day 5, build this in `admin.py` for a model of your choice (use `Comment`):
+
+- Register with the decorator and a `ModelAdmin`
+- `list_display` with 3+ columns including one custom method column
+- `list_filter` and `search_fields` that span a relationship
+- `list_select_related` to prevent N+1
+- One custom action that updates the selected rows and shows a message
+- Then add an inline of some model into another model's page
+
+Check yourself with these questions:
+
+1. Why does `.update()` in an action not touch `auto_now` fields?
+2. What does `autocomplete_fields` require of the related admin?
+3. Why use `get_queryset` with `annotate` for a count column?
+4. How would you make a field visible but not editable?
+
+Answers: (1) `update()` goes straight to SQL and bypasses `save()`; (2) it needs `search_fields`; (3) one SQL query instead of one per row; (4) `readonly_fields`.
+
+## Part 4: Django ORM vs SQLAlchemy, 5 differences
+
+Write your own five first, then compare. Here is a reference set:
+
+| # | Topic | Django ORM | SQLAlchemy |
+|---|---|---|---|
+| 1 | **Pattern** | Active Record: the model instance saves itself (`post.save()`) | Data Mapper + Unit of Work: a `Session` tracks objects and flushes them (`session.add(post); session.commit()`) |
+| 2 | **Session** | Implicit; you never manage one | Explicit `Session` you create, pass around, and close |
+| 3 | **Query style** | Lookup strings: `filter(title__icontains="x")` | Python expressions: `select(Post).where(Post.title.ilike("%x%"))` |
+| 4 | **Eager loading** | `select_related` (JOIN) and `prefetch_related` (separate query) | `joinedload`, `selectinload`, `subqueryload`, configurable per query or per relationship |
+| 5 | **Migrations** | Built in and automatic (`makemigrations`) | Separate tool (Alembic) that you set up and configure |
+| 6 | **Scope** | Part of a full framework (admin, auth, forms all use it) | Standalone library; works with any framework |
+| 7 | **Flexibility** | Opinionated; raw SQL and complex queries are harder | Fine-grained control, closer to SQL, supports multiple mapping styles |
+| 8 | **Lazy loading** | Related objects lazy-load on attribute access, with the N+1 trap | Same trap by default, but you can set `lazy="raise"` to make it an error |
+
+Pick your top five. For your own notes, I'd highlight 1, 2, 4, 5, and 6, because they shape how you structure code. One caveat: Django's `select_related` is close to `joinedload`, but `prefetch_related` is closer to `selectinload`, so the Day 4 comparison was only half right.
+
+## Part 5: Gap list (10 min)
+
+Finish by writing three lines in a `NOTES.md` file:
+
+1. **One thing I got wrong or forgot** (e.g., `null=True` without `blank=True`).
+2. **One thing I want to understand more deeply** (e.g., how `Count(filter=...)` becomes SQL).
+3. **One thing I could now teach someone else.**
+
+Print one queryset's SQL (`print(qs.query)`) for something you got wrong, and read it. That's usually where the misunderstanding shows up.
+
+## Day 6 checklist
+
+- [ ] Rebuilt `Post` and `Comment` from memory and scored against the rubric
+- [ ] Completed 10 new ORM queries and scored yourself
+- [ ] Built a `ModelAdmin` with action, custom column, and inline without notes
+- [ ] Wrote your own 5 Django vs SQLAlchemy differences before reading mine
+- [ ] Wrote the 3-line gap list
+- [ ] Scratch app removed
+
+## Common gotchas
+
+- **Peeking too early.** If you look after 2 minutes, you've turned recall into reading. Give yourself a real 10 minutes of struggle first.
+- **Leaving the scratch app in `INSTALLED_APPS`**: its `Post` model can confuse reverse accessors and migrations later.
+- **Treating query count as optional**: for each ORM query above, wrap one or two in `CaptureQueriesContext` to verify the query counts you claimed.
+
+Day 7 usually starts templates and views: `render()`, template inheritance, and the post list/detail pages. Want that outline next?
