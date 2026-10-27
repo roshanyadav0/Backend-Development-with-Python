@@ -1,0 +1,193 @@
+# Day 7: Django REST Framework Setup
+
+## Part 1: What DRF adds
+
+Django views return HTML or whatever you build by hand. DRF gives you three things for building JSON APIs:
+
+- **Serializers**: convert model instances to JSON-ready data (and validate incoming JSON back into models). Think of them as Django forms for APIs.
+- **Request/Response**: `Request` parses JSON bodies into `request.data`; `Response` renders to JSON (or the browsable HTML page) based on what the client asks for.
+- **Views**: `APIView` and friends handle auth, permissions, content negotiation, and error formatting.
+
+## Part 2: Install and configure
+
+```bash
+pip install djangorestframework
+```
+
+**blog_platform/settings.py**
+```python
+INSTALLED_APPS = [
+    # ...existing apps...
+    "rest_framework",
+    "posts",
+]
+```
+
+Optional but useful, a starting config at the bottom of `settings.py`:
+
+```python
+REST_FRAMEWORK = {
+    "DEFAULT_PERMISSION_CLASSES": [
+        "rest_framework.permissions.AllowAny",
+    ],
+}
+```
+
+`AllowAny` is also the default; writing it out makes it visible. You'll tighten this in the auth days.
+
+## Part 3: The serializer
+
+Create **posts/serializers.py** (Django doesn't generate it):
+
+```python
+from rest_framework import serializers
+from .models import Post
+
+
+class PostSerializer(serializers.ModelSerializer):
+    author = serializers.StringRelatedField()
+
+    class Meta:
+        model = Post
+        fields = [
+            "id", "title", "slug", "body", "author",
+            "status", "created_at", "updated_at", "published_at",
+        ]
+```
+
+How it works:
+
+- `ModelSerializer` inspects the model and builds matching fields automatically, like `ModelForm` does.
+- `fields` is an explicit allow-list. Prefer it over `"__all__"` so you never leak a field by accident when the model changes.
+- `author = StringRelatedField()` outputs the author's `__str__` (the username) instead of a bare ID. It is read-only, which is fine for today because we're only reading.
+
+Try it in the shell to see what a serializer produces:
+
+```bash
+python manage.py shell
+```
+```python
+from posts.models import Post
+from posts.serializers import PostSerializer
+
+post = Post.objects.first()
+print(PostSerializer(post).data)
+# {'id': 1, 'title': 'My First Post', ..., 'author': 'alice', ...}
+```
+
+Notice `.data` is a dict, not a JSON string. The renderer turns it into JSON later.
+
+## Part 4: The APIView
+
+**posts/views.py** (keep your Day 2 views; add this below them)
+
+```python
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from .models import Post
+from .serializers import PostSerializer
+
+
+class PostListAPIView(APIView):
+    def get(self, request):
+        posts = Post.objects.select_related("author")
+        serializer = PostSerializer(posts, many=True)
+        return Response(serializer.data)
+```
+
+- `many=True` tells the serializer it's getting a queryset, not one object.
+- `select_related("author")` is the Day 4 N+1 fix. Without it, `StringRelatedField` would query the author once per post.
+- Class-based: each HTTP method is a method on the class (`get`, `post`, `put`, `delete`). This is your first class-based view; the function-based ones from Day 2 map one function to everything.
+
+## Part 5: Wire up the URL
+
+Keep API routes separate from the HTML ones. Create **posts/api_urls.py**:
+
+```python
+from django.urls import path
+from . import views
+
+app_name = "posts_api"
+
+urlpatterns = [
+    path("posts/", views.PostListAPIView.as_view(), name="post-list"),
+]
+```
+
+`.as_view()` is required: Django's URL dispatcher expects a callable, and it turns the class into one.
+
+**blog_platform/urls.py**
+```python
+urlpatterns = [
+    path("admin/", admin.site.urls),
+    path("api/", include("posts.api_urls")),
+    path("posts/", include("posts.urls")),
+    path("", posts_views.home, name="home"),
+]
+```
+
+Why `api/` as a prefix: it separates JSON endpoints from HTML pages and makes versioning easy later (`api/v1/`).
+
+## Part 6: Test it
+
+```bash
+python manage.py runserver
+```
+
+**In the browser:** http://127.0.0.1:8000/api/posts/
+
+You'll see DRF's browsable API: a styled page showing the JSON response, the HTTP status, response headers, and an OPTIONS button. This appears automatically because browsers send `Accept: text/html`, so DRF picks the HTML renderer.
+
+**From the terminal**, where you get raw JSON:
+
+```bash
+curl http://127.0.0.1:8000/api/posts/
+curl -i http://127.0.0.1:8000/api/posts/          # include headers
+curl -H "Accept: application/json" http://127.0.0.1:8000/api/posts/
+```
+
+Same view, two renderings. That's content negotiation.
+
+## Part 7: Experiments (20 min)
+
+1. Remove `"author"` from `fields` and reload. Then change it to `"author"` without the `StringRelatedField` line and see you get a numeric ID instead.
+2. Add a `comment_count = serializers.IntegerField(source="comments.count", read_only=True)` field. Then check the query count with `CaptureQueriesContext`. You'll find it's N+1 again. Fix it by annotating in the view: `.annotate(comment_count=Count("comments"))` and using `serializers.IntegerField(read_only=True)`.
+3. Try `curl -X POST http://127.0.0.1:8000/api/posts/`. You get `405 Method Not Allowed`, because you only defined `get`.
+4. Visit `/api/posts/` with zero posts in the database. You should see `[]`.
+
+## Stretch: filter by status
+
+Return only published posts, and allow `?status=draft` as an override:
+
+```python
+def get(self, request):
+    posts = Post.objects.select_related("author")
+    status = request.query_params.get("status")
+    if status in Post.Status.values:
+        posts = posts.filter(status=status)
+    return Response(PostSerializer(posts, many=True).data)
+```
+
+`request.query_params` is DRF's name for `request.GET`. Note that exposing drafts to anyone is a real problem you'd fix with permissions later; for learning it's fine.
+
+## Day 7 checklist
+
+- [ ] `djangorestframework` installed, `rest_framework` in `INSTALLED_APPS`
+- [ ] `PostSerializer` written, tested in the shell
+- [ ] `PostListAPIView` returns a list of posts
+- [ ] Routed at `/api/posts/` via `include()`
+- [ ] Seen the browsable API in the browser and raw JSON via `curl`
+- [ ] Can explain `many=True` and why `select_related` is in the view
+- [ ] Hit a 405 on purpose
+
+## Common gotchas
+
+- **`ImproperlyConfigured` or template errors on the browsable API**: `rest_framework` is missing from `INSTALLED_APPS`.
+- **Forgetting `.as_view()`**: gives `TypeError` about missing `request`/`self`.
+- **Returning `serializer` instead of `serializer.data`**: `Response` can't render a serializer object.
+- **`fields` lists a name that doesn't exist on the model**: raises `ImproperlyConfigured` on first use.
+- **`StringRelatedField` is read-only**: fine for GET, but when you build POST on a later day you'll swap it for a `PrimaryKeyRelatedField` or set `author` from `request.user` in the view.
+- **Unpaginated lists**: fine now, bad at 10,000 posts. Pagination comes later.
+
+Day 8 is typically generic views and viewsets: replacing the hand-written `APIView` with `ListCreateAPIView` and `ModelViewSet`, plus routers. Want that outline next?
