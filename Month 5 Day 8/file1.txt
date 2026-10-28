@@ -1,0 +1,284 @@
+# Day 8: DRF Serializers
+
+## Part 1: ModelSerializer vs Serializer
+
+| | `ModelSerializer` | `Serializer` |
+|---|---|---|
+| Fields | Generated from the model | You declare every field by hand |
+| `create()` / `update()` | Provided | You write them (if you save at all) |
+| Validators | Inherits model rules (`unique`, `max_length`, `choices`) | Only what you declare |
+| Use when | The data maps to a model | It doesn't: login, "share by email", search params, stats, third-party payloads |
+
+Rule of thumb: start with `ModelSerializer`, and drop to `Serializer` when there's no single model behind the data.
+
+A plain `Serializer` example (input validation only, nothing saved):
+
+```python
+class SharePostSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+    message = serializers.CharField(max_length=500, required=False, allow_blank=True)
+```
+
+## Part 2: Read-only and write-only fields
+
+- **`read_only=True`**: included in output, ignored on input. Good for `id`, `created_at`, and `author` (set by the server, not the client).
+- **`write_only=True`**: accepted on input, never in output. Good for passwords.
+
+```python
+# posts/serializers.py
+from django.contrib.auth import get_user_model
+from django.contrib.auth.password_validation import validate_password
+
+User = get_user_model()
+
+
+class RegisterSerializer(serializers.ModelSerializer):
+    password = serializers.CharField(write_only=True, validators=[validate_password])
+
+    class Meta:
+        model = User
+        fields = ["id", "username", "email", "password"]
+        read_only_fields = ["id"]
+
+    def create(self, validated_data):
+        return User.objects.create_user(**validated_data)   # hashes the password
+```
+
+Two ways to mark fields read-only on a `ModelSerializer`:
+
+```python
+class Meta:
+    read_only_fields = ["created_at", "updated_at"]
+    extra_kwargs = {"body": {"min_length": 10}}   # tweak auto-generated fields
+```
+
+Never use `serializer.save()` with a plain `User.objects.create(**data)`: the password would be stored unhashed. That's why `create_user` is called above.
+
+## Part 3: Nested serializers
+
+**posts/serializers.py**
+```python
+from rest_framework import serializers
+from .models import Category, Comment, Post
+
+
+class CommentSerializer(serializers.ModelSerializer):
+    author = serializers.StringRelatedField(read_only=True)
+
+    class Meta:
+        model = Comment
+        fields = ["id", "author", "body", "created_at"]
+        read_only_fields = ["id", "created_at"]
+
+
+class PostSerializer(serializers.ModelSerializer):
+    author = serializers.StringRelatedField(read_only=True)
+    comments = CommentSerializer(many=True, read_only=True)       # nested
+    categories = serializers.SlugRelatedField(                    # writable by slug
+        many=True, slug_field="slug",
+        queryset=Category.objects.all(), required=False,
+    )
+    comment_count = serializers.SerializerMethodField()
+    like_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Post
+        fields = [
+            "id", "title", "slug", "body", "author", "status",
+            "categories", "comments", "comment_count", "like_count",
+            "created_at", "updated_at", "published_at",
+        ]
+        read_only_fields = ["id", "created_at", "updated_at", "published_at"]
+
+    def get_comment_count(self, obj):
+        return obj.comments.count()
+
+    def get_like_count(self, obj):
+        return obj.likes.count()
+```
+
+Things to understand:
+
+- **Nested output is easy; nested writes are not.** DRF refuses writable nested serializers by default (it asserts if you try to save one), because it can't know how to create or update the children. Keep nested serializers `read_only=True` and expose a separate endpoint for creating comments (Day 9+).
+- **`SlugRelatedField`** lets clients send `"categories": ["django", "python"]` instead of IDs. It needs a `queryset` to validate input against.
+- **`SerializerMethodField`** is always read-only. It calls `get_<field_name>(self, obj)`. Use it for values computed in Python.
+
+### Avoid N+1 (Day 4 again)
+
+Update the view's queryset so nothing queries per row:
+
+```python
+posts = (
+    Post.objects
+    .select_related("author")
+    .prefetch_related("categories", "comments__author", "likes")
+)
+```
+
+Calling `.count()` on a **prefetched** related manager reads from the prefetch cache, so `get_comment_count` and `get_like_count` cost no extra queries here. Without the prefetch, each one is a query per post. Verify with `CaptureQueriesContext`.
+
+Alternative: if you only need counts, not the nested data, annotate instead, which is cheaper than loading every comment:
+
+```python
+.annotate(comment_total=Count("comments", distinct=True),
+          like_total=Count("likes", distinct=True))
+```
+
+Note the `distinct=True`. Two counts across two joins multiply each other's rows, and without `distinct` you get inflated numbers.
+
+## Part 4: Validation
+
+Validation runs in this order when you call `is_valid()`: field-level (types, `max_length`, validators), then `validate_<field>`, then the object-level `validate()`.
+
+```python
+class PostSerializer(serializers.ModelSerializer):
+    # ...fields from above...
+
+    def validate_title(self, value):
+        """Field-level: receives one value, returns it (cleaned) or raises."""
+        value = value.strip()
+        if len(value) < 5:
+            raise serializers.ValidationError("Title must be at least 5 characters.")
+        return value
+
+    def validate(self, attrs):
+        """Object-level: receives the dict of all validated fields."""
+        status = attrs.get("status", getattr(self.instance, "status", None))
+        body = attrs.get("body", getattr(self.instance, "body", ""))
+        if status == Post.Status.PUBLISHED and len(body) < 50:
+            raise serializers.ValidationError(
+                {"body": "A published post needs at least 50 characters."}
+            )
+        return attrs
+```
+
+Key points:
+
+- Always **return** the value (or `attrs`) from a validator, or the field becomes `None`.
+- Raising with a dict (`{"body": "..."}`) attaches the error to that field. Raising with a plain string puts it under `non_field_errors`.
+- On `PATCH` (partial update), `attrs` only contains the fields the client sent. That's why `validate()` falls back to `self.instance`.
+- `slug` uniqueness comes free: `ModelSerializer` turns `unique=True` into a `UniqueValidator`.
+
+### Reusable validators
+
+```python
+def no_spam(value):
+    if "buy now" in value.lower():
+        raise serializers.ValidationError("No spam, please.")
+
+body = serializers.CharField(validators=[no_spam])
+```
+
+## Part 5: `to_representation`
+
+`to_representation(instance)` turns a model instance into the output dict. Override it to reshape the whole output:
+
+```python
+def to_representation(self, instance):
+    data = super().to_representation(instance)
+    data["reading_time_minutes"] = max(1, len(instance.body.split()) // 200)
+    return data
+```
+
+When to use which:
+
+- **`SerializerMethodField`**: add one computed field. Declared alongside the others, easy to read.
+- **`to_representation`**: reshape or rename many fields, drop fields conditionally, or change the shape depending on context (e.g., hide `body` in a list view).
+
+Its counterpart `to_internal_value` handles the input direction, and you'll rarely need it.
+
+## Part 6: Shell practice (30 min)
+
+```bash
+python manage.py shell
+```
+
+```python
+from django.contrib.auth import get_user_model
+from posts.models import Post
+from posts.serializers import PostSerializer
+
+alice = get_user_model().objects.get(username="alice")
+
+# 1. Invalid data: inspect the errors
+s = PostSerializer(data={"title": "Hi", "slug": "hi", "body": "short"})
+print(s.is_valid())     # False
+print(s.errors)         # {'title': ['Title must be at least 5 characters.']}
+
+# 2. Object-level validation
+s = PostSerializer(data={"title": "Valid title", "slug": "valid-title",
+                         "body": "too short", "status": "published"})
+s.is_valid(); print(s.errors)     # {'body': [...at least 50 characters]}
+
+# 3. Valid data, with the server supplying author
+s = PostSerializer(data={"title": "Serializer practice", "slug": "ser-practice",
+                         "body": "x" * 60, "categories": ["django"]})
+s.is_valid(raise_exception=True)
+post = s.save(author=alice)       # extra kwargs are merged into validated_data
+
+# 4. Try to set a read-only field: it's silently ignored
+s = PostSerializer(data={"title": "Another one", "slug": "another",
+                         "body": "y" * 60, "id": 999, "author": "bob"})
+s.is_valid(); print(s.validated_data)   # no 'id', no 'author'
+
+# 5. Partial update
+s = PostSerializer(post, data={"title": "Renamed post"}, partial=True)
+s.is_valid(raise_exception=True); s.save()
+
+# 6. Output
+print(PostSerializer(post).data)
+```
+
+## Part 7: Wire up POST (optional but recommended)
+
+Add a `post` method to the Day 7 view so validation is visible over HTTP:
+
+```python
+from rest_framework import status
+from rest_framework.permissions import IsAuthenticatedOrReadOnly
+
+class PostListAPIView(APIView):
+    permission_classes = [IsAuthenticatedOrReadOnly]
+
+    def get(self, request):
+        ...  # as before, with prefetch_related
+
+    def post(self, request):
+        serializer = PostSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)      # auto-returns 400 with errors
+        serializer.save(author=request.user)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+```
+
+Log in through `/admin/` first (session authentication is on by default), then use the form at the bottom of the browsable API at `/api/posts/`. Submit bad data and read the 400 response. Anonymous POSTs get 403.
+
+## Stretch goals
+
+- Add a `PostListSerializer` that omits `body` and `comments`, and a `PostDetailSerializer` that includes them. Using a lighter serializer for lists is a very common pattern.
+- Write a `validate_categories` that limits a post to 5 categories.
+- Add `SharePostSerializer` to a view and return `400` for a bad email.
+- Compare `PostSerializer(post).data` against `PostSerializer(post, context={"request": request})` and read about why `context` matters for `HyperlinkedModelSerializer`.
+
+## Day 8 checklist
+
+- [ ] Can say when to choose `Serializer` over `ModelSerializer`
+- [ ] Used `read_only` and `write_only` (register serializer with password)
+- [ ] `CommentSerializer` nested inside `PostSerializer`
+- [ ] `validate_title` and object-level `validate()` both working
+- [ ] `comment_count` and `like_count` via `SerializerMethodField`
+- [ ] Overrode `to_representation` and know when to prefer it over a method field
+- [ ] Confirmed query count with `CaptureQueriesContext`
+- [ ] Ran all six shell experiments and understood each result
+
+## Common gotchas
+
+- **Nested + `read_only=True` forgotten**: saving raises an assertion about writable nested serializers.
+- **Validator forgets to `return`**: the field silently becomes `None`.
+- **Forgetting `many=True`** on a nested serializer for a to-many relation: you get an "object is not iterable" error or wrong output.
+- **`SerializerMethodField` expecting input**: it's output-only, and sent values are ignored.
+- **Counting with a method field but no prefetch**: perfectly correct output, silently terrible performance.
+- **`PATCH` validation reading `attrs["field"]` directly**: `KeyError` when the client didn't send it. Use `.get()` with a fallback to `self.instance`.
+- **Putting `author` in client-writable fields**: lets users post as someone else. Set it from `request.user` in `save()`.
+- **`fields = "__all__"`**: convenient, but it leaks new model fields automatically. Keep the explicit list.
+
+Day 9 is typically generic views and viewsets: replacing the hand-written `APIView` with `ListCreateAPIView`, `ModelViewSet`, and routers. Want that outline next?
