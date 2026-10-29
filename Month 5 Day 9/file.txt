@@ -1,0 +1,352 @@
+# Day 9: DRF ViewSets & Routers
+
+## Part 1: The idea
+
+On Day 7 you hand-wrote `get` and `post` on an `APIView`. For standard CRUD that's repetitive. DRF has layers, each doing more for you:
+
+| Layer | What you write | Use when |
+|---|---|---|
+| `APIView` | every method by hand | Unusual endpoints |
+| Generic views (`ListCreateAPIView`, `RetrieveUpdateDestroyAPIView`) | `queryset` + `serializer_class`, one view per URL shape | You want explicit per-URL control |
+| `ModelViewSet` | `queryset` + `serializer_class`, once | Standard CRUD on a model |
+
+A **ViewSet** is a view that groups related actions (list, retrieve, create...) in one class. It doesn't bind them to URLs itself. A **Router** does that, reading the viewset and generating the routes.
+
+## Part 2: Actions and HTTP methods
+
+`ModelViewSet` provides six actions. The router maps them like this:
+
+| URL | Method | Action | Meaning |
+|---|---|---|---|
+| `/posts/` | GET | `list` | all posts |
+| `/posts/` | POST | `create` | new post |
+| `/posts/{pk}/` | GET | `retrieve` | one post |
+| `/posts/{pk}/` | PUT | `update` | replace all fields |
+| `/posts/{pk}/` | PATCH | `partial_update` | change some fields |
+| `/posts/{pk}/` | DELETE | `destroy` | delete |
+
+`ModelViewSet` is just a composition of mixins (`ListModelMixin`, `CreateModelMixin`, `RetrieveModelMixin`, `UpdateModelMixin`, `DestroyModelMixin`) plus `GenericViewSet`. Need less? Compose your own, for example a read-only API:
+
+```python
+from rest_framework import viewsets
+
+class PostReadOnlyViewSet(viewsets.ReadOnlyModelViewSet):  # list + retrieve only
+    ...
+```
+
+## Part 3: Serializers for this day
+
+Update **posts/serializers.py**. Splitting list and detail serializers is the stretch goal from Day 8, and it fits naturally here:
+
+```python
+class PostListSerializer(serializers.ModelSerializer):
+    author = serializers.StringRelatedField(read_only=True)
+    categories = serializers.SlugRelatedField(
+        many=True, slug_field="slug", queryset=Category.objects.all(), required=False
+    )
+    comment_count = serializers.IntegerField(read_only=True)
+    like_count = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = Post
+        fields = [
+            "id", "title", "slug", "author", "status", "categories",
+            "comment_count", "like_count", "created_at", "published_at",
+        ]
+        read_only_fields = ["id", "created_at", "published_at"]
+
+
+class PostDetailSerializer(PostListSerializer):
+    comments = CommentSerializer(many=True, read_only=True)
+
+    class Meta(PostListSerializer.Meta):
+        fields = PostListSerializer.Meta.fields + ["body", "comments", "updated_at"]
+```
+
+`comment_count` and `like_count` are plain read-only integers now, filled by `annotate` in the view (below), so there are no `SerializerMethodField` queries.
+
+Reuse your Day 8 `validate_title` and `validate()` by moving them into `PostListSerializer`; the detail subclass inherits them. One catch: `validate()` reads `body`, which isn't in the list serializer's fields. On create and update you'll want the detail serializer, which the `get_serializer_class` method below handles.
+
+`CommentSerializer` from Day 8 stays as is. For the comments endpoint, `post` will come from the URL, not the client.
+
+## Part 4: The Post ViewSet
+
+**posts/views.py**
+```python
+from django.db.models import Count
+from rest_framework import viewsets, status
+from rest_framework.response import Response
+
+from .models import Comment, Post
+from .serializers import (
+    CommentSerializer, PostDetailSerializer, PostListSerializer,
+)
+
+
+class PostViewSet(viewsets.ModelViewSet):
+    lookup_field = "slug"
+    permission_classes = [IsAuthenticatedOrReadOnly]
+
+    def get_queryset(self):
+        return (
+            Post.objects
+            .select_related("author")
+            .prefetch_related("categories")
+            .annotate(
+                comment_count=Count("comments", distinct=True),
+                like_count=Count("likes", distinct=True),
+            )
+        )
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return PostListSerializer
+        return PostDetailSerializer
+
+    def perform_create(self, serializer):
+        serializer.save(author=self.request.user)
+```
+
+(Add `from rest_framework.permissions import IsAuthenticatedOrReadOnly` to the imports.)
+
+What's happening:
+
+- **`get_queryset()`** instead of a `queryset =` attribute, because the annotate/prefetch is built per request and the router needs a basename. If you use `get_queryset`, pass `basename` when registering (below).
+- **`get_serializer_class()`** chooses a serializer per action, the standard pattern for lightweight lists.
+- **`perform_create()`** is the hook where you inject server-side data, here `author=request.user`. Similar hooks exist: `perform_update`, `perform_destroy`.
+- **`lookup_field = "slug"`** makes URLs `/posts/my-first-post/` instead of `/posts/1/`. Slugs are unique, so this is safe. Your `<int:...>` Day 2 converter doesn't apply here, because the router uses its own regex.
+
+### A gap to know about
+
+Anyone authenticated can currently edit or delete anyone else's post. Closing that needs an object-level permission. It's short, so add it now:
+
+```python
+# posts/permissions.py
+from rest_framework import permissions
+
+class IsAuthorOrReadOnly(permissions.BasePermission):
+    def has_object_permission(self, request, view, obj):
+        if request.method in permissions.SAFE_METHODS:
+            return True
+        return obj.author == request.user
+```
+
+```python
+permission_classes = [IsAuthenticatedOrReadOnly, IsAuthorOrReadOnly]
+```
+
+Full permissions and auth get their own day later; this is just the minimum so your API isn't wide open.
+
+## Part 5: Comments ViewSet
+
+Comments belong to a post, so nest the URL: `/posts/{slug}/comments/`. The simplest approach, with no extra packages, is a separate viewset that reads the post slug from the URL.
+
+```python
+from django.shortcuts import get_object_or_404
+
+class CommentViewSet(viewsets.ModelViewSet):
+    serializer_class = CommentSerializer
+    permission_classes = [IsAuthenticatedOrReadOnly, IsAuthorOrReadOnly]
+
+    def get_post(self):
+        return get_object_or_404(Post, slug=self.kwargs["post_slug"])
+
+    def get_queryset(self):
+        return (
+            Comment.objects
+            .filter(post=self.get_post())
+            .select_related("author")
+        )
+
+    def perform_create(self, serializer):
+        serializer.save(author=self.request.user, post=self.get_post())
+```
+
+The comment's `post` and `author` are never accepted from the client. The URL and the logged-in user supply them. Scoping `get_queryset` to the post also means `/posts/a/comments/5/` returns 404 if comment 5 belongs to a different post.
+
+## Part 6: Routers
+
+**posts/api_urls.py** (replaces the Day 7 version)
+```python
+from django.urls import include, path
+from rest_framework.routers import DefaultRouter
+
+from . import views
+
+app_name = "posts_api"
+
+router = DefaultRouter()
+router.register("posts", views.PostViewSet, basename="post")
+
+comment_list = views.CommentViewSet.as_view({"get": "list", "post": "create"})
+comment_detail = views.CommentViewSet.as_view(
+    {"get": "retrieve", "put": "update", "patch": "partial_update", "delete": "destroy"}
+)
+
+urlpatterns = [
+    path("", include(router.urls)),
+    path("posts/<slug:post_slug>/comments/", comment_list, name="comment-list"),
+    path("posts/<slug:post_slug>/comments/<int:pk>/", comment_detail, name="comment-detail"),
+]
+```
+
+What the router generates for `posts`:
+
+```
+/api/                         API root (DefaultRouter only): links to all endpoints
+/api/posts/                   list, create       (name: post-list)
+/api/posts/{slug}/            retrieve, update, partial_update, destroy   (name: post-detail)
+```
+
+- **`basename`** is required when the viewset has no `queryset` attribute. It prefixes the URL names (`post-list`, `post-detail`).
+- **`DefaultRouter` vs `SimpleRouter`**: Default adds the API root page and optional `.json` format suffixes. Simple is the same without those.
+- **`.as_view({...})`** is the manual version of what the router does: it maps HTTP methods to actions. Here we hand-map the comments routes to show you what routers hide. Later you can swap this for the `drf-nested-routers` package.
+- If you use `app_name`, remember `reverse("posts_api:post-list")`. In `include()` you may need to ensure Day 7's `PostListAPIView` is removed from the URLs.
+
+## Part 7: Overriding actions
+
+Sometimes the default isn't enough. Override the method and call `super()`, or hook into smaller steps.
+
+```python
+class PostViewSet(viewsets.ModelViewSet):
+    # ...
+
+    def retrieve(self, request, *args, **kwargs):
+        # example: only show drafts to their author
+        post = self.get_object()
+        if post.status == Post.Status.DRAFT and post.author != request.user:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(self.get_serializer(post).data)
+
+    def list(self, request, *args, **kwargs):
+        # example: default to published only
+        qs = self.filter_queryset(self.get_queryset())
+        if request.query_params.get("status") != "all":
+            qs = qs.filter(status=Post.Status.PUBLISHED)
+        page = self.paginate_queryset(qs)
+        if page is not None:
+            return self.get_paginated_response(self.get_serializer(page, many=True).data)
+        return Response(self.get_serializer(qs, many=True).data)
+```
+
+Prefer the smallest hook that works. Usually it's better to override `get_queryset` (for filtering what's visible) than to rewrite `list` and `retrieve`. The draft rule above is actually cleaner as:
+
+```python
+def get_queryset(self):
+    qs = ...  # as before
+    user = self.request.user
+    if self.action in ("list", "retrieve") and not user.is_staff:
+        qs = qs.filter(Q(status=Post.Status.PUBLISHED) | Q(author=user)) if user.is_authenticated \
+             else qs.filter(status=Post.Status.PUBLISHED)
+    return qs
+```
+
+(Needs `from django.db.models import Q`.) That way drafts are hidden everywhere, and `update`/`destroy` also respect it.
+
+### Custom actions with `@action`
+
+For endpoints outside CRUD, such as liking a post:
+
+```python
+from rest_framework.decorators import action
+from .models import Like
+
+class PostViewSet(viewsets.ModelViewSet):
+    # ...
+
+    @action(detail=True, methods=["post"], permission_classes=[IsAuthenticated])
+    def like(self, request, slug=None):
+        post = self.get_object()
+        _, created = Like.objects.get_or_create(post=post, user=request.user)
+        return Response(
+            {"liked": created},
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+```
+
+The router creates `POST /api/posts/{slug}/like/` automatically. `detail=True` means it operates on one object (uses the slug); `detail=False` would be a collection-level route like `/posts/recent/`. (Add `IsAuthenticated` to the permissions import.)
+
+## Part 8: Try it
+
+```bash
+python manage.py runserver
+```
+
+Log in via `/admin/` for session auth, then explore http://127.0.0.1:8000/api/ in the browser. The API root lists your endpoints.
+
+From the terminal (use your superuser credentials via basic auth, which DRF allows only if you add `BasicAuthentication`; otherwise rely on the browsable API after logging in):
+
+```bash
+curl http://127.0.0.1:8000/api/posts/
+curl http://127.0.0.1:8000/api/posts/my-first-post/
+curl http://127.0.0.1:8000/api/posts/my-first-post/comments/
+```
+
+To test writes from curl, temporarily add this to `settings.py` (for local learning only):
+
+```python
+REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework.authentication.SessionAuthentication",
+        "rest_framework.authentication.BasicAuthentication",
+    ],
+    "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.AllowAny"],
+}
+```
+
+```bash
+curl -u admin:yourpassword -X POST http://127.0.0.1:8000/api/posts/ \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Created via curl", "slug": "via-curl", "body": "A body that is long enough to pass validation, at least fifty characters."}'
+
+curl -u admin:yourpassword -X POST http://127.0.0.1:8000/api/posts/via-curl/comments/ \
+  -H "Content-Type: application/json" -d '{"body": "First!"}'
+
+curl -u admin:yourpassword -X PATCH http://127.0.0.1:8000/api/posts/via-curl/ \
+  -H "Content-Type: application/json" -d '{"status": "published"}'
+
+curl -u admin:yourpassword -X DELETE http://127.0.0.1:8000/api/posts/via-curl/
+```
+
+Basic auth sends passwords on every request, so never ship it that way. JWT or token auth comes later.
+
+## Experiments (20 min)
+
+1. Count queries on `GET /api/posts/` with 20 posts. It should be a small constant (posts, categories prefetch, and the like), not growing with post count. Try `django-debug-toolbar` or `CaptureQueriesContext` in a test.
+2. Delete `lookup_field` and see URLs switch back to numeric IDs.
+3. Visit `/api/posts/nonexistent/` and confirm a 404 JSON response.
+4. Try editing another user's post (create a second user in admin) and confirm 403.
+5. Change `PostViewSet` to `ReadOnlyModelViewSet`; check the API root and see POST disappear.
+
+## Stretch goals
+
+- Add `@action(detail=False)` for `/api/posts/mine/` returning the current user's posts.
+- Add pagination in settings: `"DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination", "PAGE_SIZE": 10`, then see how the list response shape changes (`count`, `next`, `results`).
+- Add `unlike` handling by supporting `DELETE` on the `like` action.
+- Write a test using `APIClient` for the create-and-comment flow.
+
+## Day 9 checklist
+
+- [ ] `PostViewSet` serving full CRUD at `/api/posts/`
+- [ ] Router registered, API root page visible
+- [ ] Can name the action for each HTTP method without looking
+- [ ] Different serializers for list vs detail via `get_serializer_class`
+- [ ] `author` set via `perform_create`, never from the client
+- [ ] Comments CRUD working under `/api/posts/{slug}/comments/`
+- [ ] Object-level permission blocks editing others' content
+- [ ] Custom `like` action working
+- [ ] Queryset optimized, query count verified
+
+## Common gotchas
+
+- **`basename` error**: `AssertionError: 'basename' argument not specified`. Happens when the viewset has no `queryset` attribute. Pass `basename=` to `register`.
+- **Old Day 7 route still active**: if `PostListAPIView` remains in `api_urls.py`, it shadows the router. Remove it.
+- **Using `lookup_field` but the URL kwarg differs**: detail actions receive the field named by `lookup_field` (`slug`), so custom actions should take `slug=None`, not `pk=None`.
+- **Slug route eating other routes**: `<slug>` accepts any slug-like text, so a custom `detail=False` route like `/posts/mine/` is registered before the detail route automatically by the router, but a post with slug `mine` would be unreachable. Avoid reserved slugs.
+- **Serializer `validate()` fails on `body` in list serializer**: use the detail serializer for writes, as `get_serializer_class` does.
+- **Aggregates multiply across joins**: always `distinct=True` when counting two relations in one `annotate`, as in Day 8.
+- **Overriding `list`/`retrieve` when `get_queryset` would do**: more code, more bugs, and you lose permission consistency.
+- **Forgetting `permission_classes` on writes**: the default `AllowAny` lets anonymous users create posts and then crash in `perform_create` because `request.user` is anonymous.
+- **Trusting the client for `post`/`author`**: inject them in `perform_create`.
+
+Day 10 is typically authentication: token or JWT auth, registration and login endpoints, and tightening permissions properly. Want that outline next?
