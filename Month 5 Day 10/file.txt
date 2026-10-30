@@ -1,0 +1,398 @@
+# Day 10: DRF Auth, Token Authentication
+
+## Part 1: Authentication vs permissions
+
+These are two separate steps, and mixing them up causes most confusion:
+
+| Step | Question | DRF setting | Result |
+|---|---|---|---|
+| **Authentication** | *Who are you?* | `DEFAULT_AUTHENTICATION_CLASSES` | Sets `request.user` and `request.auth` |
+| **Permission** | *Are you allowed to do this?* | `DEFAULT_PERMISSION_CLASSES` | Allows, or returns 401/403 |
+
+Authentication never rejects anyone on its own. If no credentials are sent, `request.user` is an `AnonymousUser`. Permission classes decide what anonymous users can do.
+
+**How tokens work:** the user logs in once with username and password and receives a long random string. The client sends that string in a header on every later request, so the password isn't sent again.
+
+```
+Authorization: Token 9944b09199c62bcf9418ad846dd0e4bbdfc6ee4b
+```
+
+The word is `Token`, not `Bearer`. (`Bearer` is for JWT, which comes later.)
+
+## Part 2: Setup
+
+**blog_platform/settings.py**
+```python
+INSTALLED_APPS = [
+    # ...
+    "rest_framework",
+    "rest_framework.authtoken",   # adds the Token model
+    "posts",
+]
+
+REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework.authentication.TokenAuthentication",
+        "rest_framework.authentication.SessionAuthentication",  # keeps the browsable API login working
+    ],
+    "DEFAULT_PERMISSION_CLASSES": [
+        "rest_framework.permissions.IsAuthenticatedOrReadOnly",
+    ],
+}
+```
+
+This **replaces** the temporary Day 9 config. Remove `BasicAuthentication`, which was for local testing only.
+
+The new app has its own table, so migrate:
+
+```bash
+python manage.py migrate
+```
+
+Setting the global default to `IsAuthenticatedOrReadOnly` means any view you forget to protect is still safe for writes. A secure default with explicit opt-outs beats the reverse.
+
+### Tokens for existing users
+
+Users created before today have no token. Create one per user:
+
+```bash
+python manage.py drf_create_token alice
+```
+
+or in the shell: `Token.objects.get_or_create(user=alice)`. For new users, the register endpoint below creates them.
+
+## Part 3: Login, register, logout endpoints
+
+DRF ships a login view, `obtain_auth_token`. It accepts `username` and `password` and returns `{"token": "..."}`. A small subclass can return more.
+
+Put these in **posts/views.py** for now. A real project would have a separate `accounts` app.
+
+```python
+from rest_framework import generics
+from rest_framework.authtoken.models import Token
+from rest_framework.authtoken.views import ObtainAuthToken
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from .serializers import RegisterSerializer
+
+
+class LoginView(ObtainAuthToken):
+    """POST {username, password} -> {token, user_id, username}"""
+
+    def post(self, request, *args, **kwargs):
+        serializer = self.serializer_class(
+            data=request.data, context={"request": request}
+        )
+        serializer.is_valid(raise_exception=True)      # 400 on bad credentials
+        user = serializer.validated_data["user"]
+        token, _ = Token.objects.get_or_create(user=user)
+        return Response(
+            {"token": token.key, "user_id": user.pk, "username": user.username}
+        )
+
+
+class RegisterView(generics.CreateAPIView):
+    """POST {username, email, password} -> creates a user and returns a token."""
+    serializer_class = RegisterSerializer          # from Day 8
+    permission_classes = [AllowAny]
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()                   # create_user hashes the password
+        token = Token.objects.create(user=user)
+        return Response(
+            {"token": token.key, "user_id": user.pk, "username": user.username},
+            status=201,
+        )
+
+
+class LogoutView(APIView):
+    """POST with a valid token -> deletes it, so the token stops working."""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        if request.auth is not None:               # None under session auth
+            request.auth.delete()
+        return Response(status=204)
+```
+
+(Move `RegisterSerializer` to `posts/serializers.py` if it isn't there yet.)
+
+**posts/api_urls.py**
+```python
+urlpatterns = [
+    path("auth/register/", views.RegisterView.as_view(), name="register"),
+    path("auth/login/", views.LoginView.as_view(), name="login"),
+    path("auth/logout/", views.LogoutView.as_view(), name="logout"),
+    path("", include(router.urls)),
+    # ...comment routes from Day 9
+]
+```
+
+Full URLs are `/api/auth/login/` and so on. Django conventions put a trailing slash on every route, so the `/auth/login` from your outline becomes `/api/auth/login/`.
+
+## Part 4: Using the token
+
+```bash
+# Register
+curl -X POST http://127.0.0.1:8000/api/auth/register/ \
+  -H "Content-Type: application/json" \
+  -d '{"username": "carol", "email": "carol@example.com", "password": "a-strong-pass-123"}'
+
+# Login
+curl -X POST http://127.0.0.1:8000/api/auth/login/ \
+  -H "Content-Type: application/json" \
+  -d '{"username": "carol", "password": "a-strong-pass-123"}'
+# {"token": "9944b0...", "user_id": 5, "username": "carol"}
+
+# Use the token
+TOKEN=9944b0...
+curl -X POST http://127.0.0.1:8000/api/posts/ \
+  -H "Authorization: Token $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Hello with a token", "slug": "token-hello", "body": "A body that is long enough to pass the fifty character validation."}'
+
+# Without the token: rejected
+curl -i -X POST http://127.0.0.1:8000/api/posts/ -H "Content-Type: application/json" -d '{}'
+
+# Logout
+curl -X POST http://127.0.0.1:8000/api/auth/logout/ -H "Authorization: Token $TOKEN"
+```
+
+### 401 vs 403
+
+- **401 Unauthorized**: "I don't know who you are." Sent when authentication failed or is missing **and** the first authentication class provides a `WWW-Authenticate` header (`TokenAuthentication` does).
+- **403 Forbidden**: "I know who you are, and you can't do this."
+
+That's why `TokenAuthentication` is listed **first**. If `SessionAuthentication` came first, anonymous users would get 403 instead of 401, because Session auth has no challenge header. A bad token gives 401 `Invalid token.`
+
+## Part 5: Permission classes
+
+DRF's built-ins:
+
+| Class | Allows |
+|---|---|
+| `AllowAny` | everyone |
+| `IsAuthenticated` | logged-in users only (reads included) |
+| `IsAuthenticatedOrReadOnly` | anyone for GET/HEAD/OPTIONS; logged-in for writes |
+| `IsAdminUser` | only `user.is_staff == True` |
+
+Set them globally in settings, or per view with `permission_classes`. Per-view overrides the global default.
+
+### Per-action permissions in a ViewSet
+
+The same viewset often needs different rules per action. Override `get_permissions`:
+
+```python
+class PostViewSet(viewsets.ModelViewSet):
+    # ...
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            permission_classes = [AllowAny]
+        elif self.action == "destroy":
+            permission_classes = [IsAuthenticated, IsAuthorOrReadOnly]
+        else:  # create, update, partial_update, like
+            permission_classes = [IsAuthenticated, IsAuthorOrReadOnly]
+        return [permission() for permission in permission_classes]
+```
+
+Note the `permission()` call, since DRF expects instances, not classes.
+
+### An admin-only route
+
+```python
+from rest_framework.permissions import IsAdminUser
+from django.contrib.auth import get_user_model
+from django.db.models import Count
+
+class StatsView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        User = get_user_model()
+        return Response({
+            "users": User.objects.count(),
+            "posts": Post.objects.count(),
+            "published": Post.objects.filter(status=Post.Status.PUBLISHED).count(),
+            "comments": Comment.objects.count(),
+        })
+```
+
+```python
+path("admin/stats/", views.StatsView.as_view(), name="stats"),
+```
+
+A regular user's token gets **403**. A staff user's token gets the stats. To test, mark a user as staff in the admin (`is_staff` checkbox), then get their token.
+
+## Part 6: Custom permission, IsAuthorOrReadOnly
+
+You wrote a first version on Day 9. Here's why it works, and a more complete version.
+
+DRF checks permissions at **two levels**:
+
+| Method | Runs | Has access to |
+|---|---|---|
+| `has_permission(request, view)` | before the view runs, on **every** request | the request and view only |
+| `has_object_permission(request, view, obj)` | only when the view calls `self.get_object()` | the specific object |
+
+Object-level checks **don't run on `list` or `create`**, because no single object is involved. That's why you pair them with `IsAuthenticated`.
+
+**posts/permissions.py**
+```python
+from rest_framework import permissions
+
+
+class IsAuthorOrReadOnly(permissions.BasePermission):
+    """Anyone can read. Only the author (or staff) can modify or delete."""
+
+    message = "You can only modify your own content."   # custom 403 message
+
+    def has_permission(self, request, view):
+        # Reads are open; writes require login (so anonymous never reaches the object check)
+        return (
+            request.method in permissions.SAFE_METHODS
+            or bool(request.user and request.user.is_authenticated)
+        )
+
+    def has_object_permission(self, request, view, obj):
+        if request.method in permissions.SAFE_METHODS:
+            return True
+        if request.user.is_staff:
+            return True
+        return obj.author_id == request.user.id
+```
+
+- `SAFE_METHODS` is `("GET", "HEAD", "OPTIONS")`.
+- `obj.author_id` compares IDs without loading the author, which saves a query.
+- `message` is what appears in the 403 response body.
+- This works for both `Post` and `Comment`, since both have an `author`. For `Like`, which uses `user`, you'd need a different check or a more generic permission.
+
+Another custom permission to practise: block comments on drafts.
+
+```python
+class CanCommentOnPublished(permissions.BasePermission):
+    message = "You cannot comment on an unpublished post."
+
+    def has_permission(self, request, view):
+        if request.method == "POST":
+            post = view.get_post()
+            return post.status == post.Status.PUBLISHED
+        return True
+```
+
+## Part 7: Test it with code
+
+Manual curl is slow. Write automated tests in **posts/tests.py**:
+
+```python
+from django.contrib.auth import get_user_model
+from rest_framework.test import APITestCase
+from rest_framework.authtoken.models import Token
+
+from .models import Post
+
+User = get_user_model()
+
+
+class AuthPermissionTests(APITestCase):
+    def setUp(self):
+        self.alice = User.objects.create_user("alice", password="pass12345")
+        self.bob = User.objects.create_user("bob", password="pass12345")
+        self.post = Post.objects.create(
+            author=self.alice, title="Alice post", slug="alice-post",
+            body="x" * 60, status=Post.Status.PUBLISHED,
+        )
+
+    def login_as(self, user):
+        token, _ = Token.objects.get_or_create(user=user)
+        self.client.credentials(HTTP_AUTHORIZATION=f"Token {token.key}")
+
+    def test_anonymous_can_read(self):
+        self.assertEqual(self.client.get("/api/posts/").status_code, 200)
+
+    def test_anonymous_cannot_write(self):
+        r = self.client.post("/api/posts/", {"title": "Nope nope", "slug": "nope", "body": "x" * 60})
+        self.assertEqual(r.status_code, 401)
+
+    def test_login_returns_token(self):
+        r = self.client.post("/api/auth/login/", {"username": "alice", "password": "pass12345"})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("token", r.data)
+
+    def test_author_can_edit_own_post(self):
+        self.login_as(self.alice)
+        r = self.client.patch("/api/posts/alice-post/", {"title": "Edited title"})
+        self.assertEqual(r.status_code, 200)
+
+    def test_other_user_cannot_edit(self):
+        self.login_as(self.bob)
+        r = self.client.patch("/api/posts/alice-post/", {"title": "Hacked title"})
+        self.assertEqual(r.status_code, 403)
+
+    def test_stats_is_admin_only(self):
+        self.login_as(self.alice)
+        self.assertEqual(self.client.get("/api/admin/stats/").status_code, 403)
+```
+
+```bash
+python manage.py test
+```
+
+(`self.client.force_authenticate(user=alice)` is a shortcut that skips tokens entirely. Use it when you're testing something other than auth.)
+
+## Part 8: Limitations of DRF tokens
+
+Be aware of what you're learning here:
+
+- **One token per user, never expires.** Logging in from a second device returns the same token. Logging out on one device logs out all.
+- **Stored in plaintext** in the `authtoken_token` table. A database leak exposes working credentials.
+- **No refresh or revocation flow** beyond deleting the row.
+- **Must be sent over HTTPS** in production, or anyone on the network can steal it.
+- **Login has no rate limiting**, so brute-forcing passwords is easy. Add throttling:
+  ```python
+  "DEFAULT_THROTTLE_CLASSES": ["rest_framework.throttling.AnonRateThrottle"],
+  "DEFAULT_THROTTLE_RATES": {"anon": "20/min"},
+  ```
+
+For a learning project or internal tool, tokens are fine. For real public apps, you'd typically move to JWT (short-lived access tokens plus refresh tokens), which is a natural next topic.
+
+## Stretch goals
+
+- Add a `GET /api/auth/me/` endpoint returning the current user's profile (`request.user`).
+- Add `@action(detail=False, permission_classes=[IsAuthenticated])` called `mine` on `PostViewSet`.
+- Apply `AnonRateThrottle` on login only, with a stricter rate, using `throttle_classes` on `LoginView`.
+- Write a `Like` permission so users can only delete their own likes.
+- Make `IsAdminOrReadOnly` and use it on a `CategoryViewSet`, so only staff manage categories.
+
+## Day 10 checklist
+
+- [ ] `rest_framework.authtoken` installed and migrated
+- [ ] Settings use `TokenAuthentication` first, with `IsAuthenticatedOrReadOnly` as the default
+- [ ] Register, login, and logout endpoints working
+- [ ] Made an authenticated request with `Authorization: Token ...`
+- [ ] `IsAdminUser` route returns 403 for normal users, 200 for staff
+- [ ] `IsAuthorOrReadOnly` blocks editing others' posts and comments
+- [ ] Can explain `has_permission` vs `has_object_permission`
+- [ ] Can explain 401 vs 403
+- [ ] Wrote and ran the permission tests
+- [ ] Can list three weaknesses of DRF tokens
+
+## Common gotchas
+
+- **`relation "authtoken_token" does not exist`**: you added the app but forgot `migrate`.
+- **Header says `Bearer` instead of `Token`**: results in 401 `Authentication credentials were not provided` or `Invalid header`.
+- **Token works in curl but the browsable API still shows logged out**: the browsable API uses the session, not the token header. Log in via `/admin/` or add the DRF login URLs: `path("api-auth/", include("rest_framework.urls"))`.
+- **Authentication class order**: if `SessionAuthentication` is first, you get 403 instead of 401 for anonymous users.
+- **Session auth and CSRF**: `SessionAuthentication` enforces CSRF on writes. Token requests are exempt, but browser logins on the browsable API need the CSRF token (handled for you there).
+- **Object permission seems ignored**: it only runs when `get_object()` is called. If you override `retrieve`/`update` and fetch the object yourself, call `self.check_object_permissions(request, obj)`.
+- **Custom permission not applied on `list`**: `has_object_permission` doesn't run on lists. Filter in `get_queryset` for visibility.
+- **Forgot `permission()` call in `get_permissions`**: returns classes instead of instances, giving a `TypeError`.
+- **Creating a token twice**: `Token.objects.create(user=...)` raises `IntegrityError` if one exists. Use `get_or_create` when unsure.
+- **Hardcoding tokens in code or Git**: treat them like passwords.
+- **Using `IsAdminUser` expecting superuser-only**: it checks `is_staff`, not `is_superuser`.
+
+Day 11 is usually filtering, search, ordering, and pagination (`django-filter`, `SearchFilter`, `PageNumberPagination`), or JWT if you'd prefer to replace tokens first. Want that outline next?
