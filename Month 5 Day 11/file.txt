@@ -1,0 +1,408 @@
+# Day 11: DRF Filtering & Pagination
+
+## Part 1: The three problems
+
+Your `GET /api/posts/` returns every post, in one response, with no way to narrow it. Today you fix that with three separate tools that compose:
+
+| Need | Tool | Query param |
+|---|---|---|
+| Exact filters ("posts in category X by author Y") | `DjangoFilterBackend` | `?category=django&status=published` |
+| Free-text search | `SearchFilter` | `?search=orm` |
+| Sorting | `OrderingFilter` | `?ordering=-created_at` |
+| Splitting results into pages | `PageNumberPagination` | `?page=2` |
+
+All of them run inside the viewset's `list` action (via `filter_queryset()` and `paginate_queryset()`), after your `get_queryset()`. Your Day 9 visibility rules (drafts hidden) still apply, and filters narrow what's left.
+
+## Part 2: Install and configure
+
+```bash
+pip install django-filter
+```
+
+The pip name is `django-filter` but the app name is `django_filters` (with an s):
+
+**blog_platform/settings.py**
+```python
+INSTALLED_APPS = [
+    # ...
+    "rest_framework",
+    "rest_framework.authtoken",
+    "django_filters",
+    "posts",
+]
+
+REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework.authentication.TokenAuthentication",
+        "rest_framework.authentication.SessionAuthentication",
+    ],
+    "DEFAULT_PERMISSION_CLASSES": [
+        "rest_framework.permissions.IsAuthenticatedOrReadOnly",
+    ],
+    "DEFAULT_FILTER_BACKENDS": [
+        "django_filters.rest_framework.DjangoFilterBackend",
+        "rest_framework.filters.SearchFilter",
+        "rest_framework.filters.OrderingFilter",
+    ],
+    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
+    "PAGE_SIZE": 10,
+}
+```
+
+Set both `DEFAULT_PAGINATION_CLASS` and `PAGE_SIZE`. Setting only `PAGE_SIZE` doesn't paginate, and recent DRF versions warn about it. Setting backends globally means every viewset supports the generic filters, but each viewset still opts in to specific fields (below).
+
+## Part 3: Seed data
+
+You can't see pagination with 4 posts. In the shell:
+
+```python
+from django.contrib.auth import get_user_model
+from posts.models import Post, Category, Comment
+
+User = get_user_model()
+alice = User.objects.get(username="alice")
+bob = User.objects.get(username="bob")
+tech, _ = Category.objects.get_or_create(name="Tech", slug="tech")
+django_cat, _ = Category.objects.get_or_create(name="Django", slug="django")
+python_cat, _ = Category.objects.get_or_create(name="Python", slug="python")
+
+for i in range(1, 31):
+    p = Post.objects.create(
+        author=alice if i % 2 else bob,
+        title=f"Sample post {i}" + (" about the Django ORM" if i % 3 == 0 else ""),
+        slug=f"sample-post-{i}",
+        body=("Lorem ipsum dolor sit amet. " * 5) + ("select_related rocks" if i % 5 == 0 else ""),
+        status=Post.Status.PUBLISHED if i % 4 else Post.Status.DRAFT,
+    )
+    p.categories.add([tech, django_cat, python_cat][i % 3])
+```
+
+## Part 4: Filtering with `django-filter`
+
+### The quick way
+
+```python
+class PostViewSet(viewsets.ModelViewSet):
+    filterset_fields = ["status", "author"]
+```
+
+That gives you `?status=published&author=2` for free. It's fine for simple exact matches, but you can't customize the param name, filter on `categories__slug`, or add ranges. For that, write a `FilterSet`.
+
+### A proper FilterSet
+
+Create **posts/filters.py**:
+
+```python
+import django_filters as filters
+
+from .models import Category, Post
+
+
+class PostFilter(filters.FilterSet):
+    # ?category=django&category=python  -> posts in ANY of those categories
+    category = filters.ModelMultipleChoiceFilter(
+        field_name="categories__slug",
+        to_field_name="slug",
+        queryset=Category.objects.all(),
+        conjoined=False,                 # OR between values; True would mean AND
+    )
+    # ?author=alice  (by username, not id)
+    author = filters.CharFilter(field_name="author__username", lookup_expr="iexact")
+
+    # ?created_after=2026-01-01&created_before=2026-06-30
+    created_after = filters.DateFilter(field_name="created_at", lookup_expr="date__gte")
+    created_before = filters.DateFilter(field_name="created_at", lookup_expr="date__lte")
+
+    class Meta:
+        model = Post
+        fields = ["status", "category", "author", "created_after", "created_before"]
+```
+
+Wire it into the viewset:
+
+```python
+from rest_framework import filters as drf_filters
+from django_filters.rest_framework import DjangoFilterBackend
+
+from .filters import PostFilter
+
+
+class PostViewSet(viewsets.ModelViewSet):
+    lookup_field = "slug"
+    filter_backends = [DjangoFilterBackend, drf_filters.SearchFilter, drf_filters.OrderingFilter]
+    filterset_class = PostFilter
+    search_fields = ["title", "body", "author__username", "categories__name"]
+    ordering_fields = ["created_at", "title", "comment_count", "like_count"]
+    ordering = ["-created_at", "-id"]
+    # ...get_queryset, get_serializer_class, etc. unchanged from Day 9
+```
+
+Things to understand:
+
+- **`filter_backends` on the view** overrides the global default, so it's the place to be explicit. Listing them again here is optional if you rely on the settings, but it makes the view self-documenting.
+- **Filter names are decoupled from model fields.** `category` is the URL param; `field_name="categories__slug"` is the ORM path (Day 4's `__` syntax again).
+- **`ModelMultipleChoiceFilter`** validates each value against the `Category` queryset. `?category=nonexistent` returns **400** with an error message instead of silently returning nothing. That's usually what you want from an API.
+- **`conjoined=False`** gives OR semantics (`?category=django&category=python` returns posts in either). Set it to `True` for "must be in all".
+- **`date__gte`** compares just the date part of a `DateTimeField`, so `created_before=2026-06-30` includes posts from that whole day.
+- **`ordering_fields`** includes `comment_count` and `like_count`, the annotations from Day 9, so clients can sort by popularity: `?ordering=-like_count`. Only fields you list are allowed, and others are ignored, which keeps clients from sorting by unindexed columns.
+- **The explicit default `ordering` with an `-id` tiebreaker** matters for pagination. If two posts share the same `created_at`, the database may order them differently between page 1 and page 2, causing duplicates or missing items across pages.
+
+### Does it still interact correctly with Day 9's annotations?
+
+Yes. The counts use `distinct=True`, so the extra join added by `categories__slug` doesn't inflate `comment_count` or `like_count`. Without `distinct=True`, filtering by category would silently corrupt those numbers.
+
+## Part 5: SearchFilter
+
+`?search=django` splits the term on whitespace and checks every term against `search_fields`:
+
+- Each **term** must match at least one field (terms are ANDed).
+- Within a term, **fields** are ORed.
+- `?search=django orm` finds posts where "django" appears somewhere **and** "orm" appears somewhere, not necessarily in the same field.
+
+Prefixes change the lookup per field:
+
+| Prefix | Lookup | Example |
+|---|---|---|
+| (none) | `icontains` | `"title"` |
+| `^` | `istartswith` | `"^title"` |
+| `=` | `iexact` | `"=author__username"` |
+| `@` | full-text (PostgreSQL only) | `"@body"` |
+| `$` | `iregex` | `"$title"` |
+
+Since `search_fields` includes `categories__name`, DRF adds `.distinct()` automatically when a search crosses a to-many relation, so you don't get duplicate posts.
+
+**Cost warning:** `icontains` on a `TextField` like `body` is a full table scan with `LIKE '%term%'`. It's fine for thousands of rows. For serious search, use PostgreSQL full-text search (`SearchVector`) or a dedicated engine. Keep `body` out of `search_fields` if it makes things slow.
+
+## Part 6: Pagination
+
+### What the default does
+
+With `PAGE_SIZE = 10`, the list response changes shape:
+
+```json
+{
+  "count": 30,
+  "next": "http://127.0.0.1:8000/api/posts/?page=2",
+  "previous": null,
+  "results": [ ... 10 posts ... ]
+}
+```
+
+**This is a breaking change** for any client that expected a bare list. Do it early, before you have clients.
+
+Note that `next` and `previous` preserve your other query params, so `?search=x&category=y&page=2` pages through the filtered results correctly.
+
+### A customized paginator
+
+The default has two limits: clients can't choose a page size, and there's no upper bound. Create **posts/pagination.py**:
+
+```python
+from rest_framework.pagination import PageNumberPagination
+
+
+class StandardPagination(PageNumberPagination):
+    page_size = 10
+    page_size_query_param = "page_size"   # ?page_size=25
+    max_page_size = 50                    # hard cap, so ?page_size=100000 can't be abused
+```
+
+Use it per viewset, or globally:
+
+```python
+class PostViewSet(viewsets.ModelViewSet):
+    pagination_class = StandardPagination
+```
+
+```python
+# or in settings.py
+"DEFAULT_PAGINATION_CLASS": "posts.pagination.StandardPagination",
+```
+
+Behavior to know:
+
+- `?page=last` works. `?page=999` returns **404** with `Invalid page.`
+- Pagination adds one extra `COUNT(*)` query per request to compute `count`.
+- **Comments are paginated too**, since `CommentViewSet` inherits the global default. To disable it for one viewset: `pagination_class = None`.
+- Pagination only affects `list`. `retrieve`, `create`, etc. are unaffected.
+
+### Alternatives (know they exist)
+
+| Class | Shape | Best for |
+|---|---|---|
+| `PageNumberPagination` | `?page=3` | Typical web UIs with page numbers |
+| `LimitOffsetPagination` | `?limit=10&offset=20` | Clients that want arbitrary windows |
+| `CursorPagination` | opaque `?cursor=...` | Infinite scroll, huge or fast-changing tables. Stable (no duplicates when new rows arrive), no deep-offset slowness, but no jumping to page N or total count |
+
+`OFFSET 100000` forces the database to skip 100,000 rows, so page-number pagination gets slower the deeper you go. For a blog that's a non-issue.
+
+## Part 7: If you overrode `list` on Day 9
+
+If you added the custom `list()` override, make sure it still goes through `filter_queryset` and `paginate_queryset`:
+
+```python
+def list(self, request, *args, **kwargs):
+    qs = self.filter_queryset(self.get_queryset())
+    page = self.paginate_queryset(qs)
+    if page is not None:
+        return self.get_paginated_response(self.get_serializer(page, many=True).data)
+    return Response(self.get_serializer(qs, many=True).data)
+```
+
+If you skip `filter_queryset`, the query params are silently ignored. That's usually a sign you should delete the override and put the logic in `get_queryset()` instead, as suggested on Day 9.
+
+## Part 8: Try it
+
+```bash
+python manage.py runserver
+```
+
+Open http://127.0.0.1:8000/api/posts/ in the browser. DRF's browsable API now shows a **Filters** button with a form.
+
+```bash
+# Page 1 and 2
+curl "http://127.0.0.1:8000/api/posts/"
+curl "http://127.0.0.1:8000/api/posts/?page=2"
+
+# Search
+curl "http://127.0.0.1:8000/api/posts/?search=orm"
+
+# Category (single and multiple)
+curl "http://127.0.0.1:8000/api/posts/?category=tech"
+curl "http://127.0.0.1:8000/api/posts/?category=tech&category=python"
+
+# The full combination from today's goal
+curl "http://127.0.0.1:8000/api/posts/?search=sample&category=django&page=2"
+
+# Ordering and page size
+curl "http://127.0.0.1:8000/api/posts/?ordering=-like_count"
+curl "http://127.0.0.1:8000/api/posts/?ordering=title&page_size=5"
+
+# Date range
+curl "http://127.0.0.1:8000/api/posts/?created_after=2026-01-01"
+
+# Errors
+curl -i "http://127.0.0.1:8000/api/posts/?category=nonexistent"   # 400
+curl -i "http://127.0.0.1:8000/api/posts/?page=999"               # 404
+```
+
+## Part 9: Test it with code
+
+Add to **posts/tests.py**:
+
+```python
+from django.contrib.auth import get_user_model
+from rest_framework.test import APITestCase
+
+from .models import Category, Post
+
+User = get_user_model()
+
+
+class FilterPaginationTests(APITestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.alice = User.objects.create_user("alice", password="pass12345")
+        cls.tech = Category.objects.create(name="Tech", slug="tech")
+        cls.py = Category.objects.create(name="Python", slug="python")
+        for i in range(25):
+            p = Post.objects.create(
+                author=cls.alice, title=f"Post number {i}", slug=f"post-{i}",
+                body="x" * 60, status=Post.Status.PUBLISHED,
+            )
+            p.categories.add(cls.tech if i % 5 == 0 else cls.py)
+
+    def test_first_page_has_10_results(self):
+        r = self.client.get("/api/posts/")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.data["count"], 25)
+        self.assertEqual(len(r.data["results"]), 10)
+        self.assertIsNotNone(r.data["next"])
+        self.assertIsNone(r.data["previous"])
+
+    def test_last_page_has_remainder(self):
+        r = self.client.get("/api/posts/?page=3")
+        self.assertEqual(len(r.data["results"]), 5)
+        self.assertIsNone(r.data["next"])
+
+    def test_page_out_of_range_is_404(self):
+        self.assertEqual(self.client.get("/api/posts/?page=99").status_code, 404)
+
+    def test_category_filter(self):
+        r = self.client.get("/api/posts/?category=tech")
+        self.assertEqual(r.data["count"], 5)
+
+    def test_unknown_category_is_400(self):
+        self.assertEqual(self.client.get("/api/posts/?category=nope").status_code, 400)
+
+    def test_search(self):
+        r = self.client.get("/api/posts/?search=number 7")
+        self.assertEqual(r.data["count"], 1)
+
+    def test_combined_filters_with_paging(self):
+        r = self.client.get("/api/posts/?category=python&search=Post&page=2&page_size=10")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.data["count"], 20)
+        self.assertEqual(len(r.data["results"]), 10)
+
+    def test_no_duplicates_across_pages(self):
+        ids = []
+        for page in (1, 2, 3):
+            ids += [p["id"] for p in self.client.get(f"/api/posts/?page={page}").data["results"]]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_page_size_is_capped(self):
+        r = self.client.get("/api/posts/?page_size=1000")
+        self.assertLessEqual(len(r.data["results"]), 50)
+```
+
+```bash
+python manage.py test posts
+```
+
+## Experiments (20 min)
+
+1. Check the query count for `GET /api/posts/` with `CaptureQueriesContext`. It should stay constant (count, posts, categories prefetch) whether the page has 5 or 10 posts.
+2. Temporarily remove `"-id"` from `ordering` and compare pages with many identical timestamps. Seeded rows created in a tight loop have near-identical times.
+3. Print `str(qs.query)` for `?category=tech&search=orm` and read the JOINs and `DISTINCT`.
+4. Set `conjoined=True` and see how `?category=tech&category=python` changes.
+5. Try `?ordering=body`. It's not in `ordering_fields`, so it's ignored. Add it and see the difference.
+6. Swap in `CursorPagination` on the comments viewset and compare the response shape.
+
+## Stretch goals
+
+- Add a `?has_comments=true` boolean filter using `filters.BooleanFilter(method="filter_has_comments")`.
+- Add `?min_likes=5` using `NumberFilter(field_name="like_count", lookup_expr="gte")`. It works because the filter runs after the annotation.
+- Add a `CommentFilter` (by `author`, date range) on the comments viewset.
+- Use `search_fields = ["^title"]` to compare prefix search against `icontains`.
+- Add a `GET /api/categories/` viewset, read-only for everyone and writable for staff, with `?search=`.
+
+## Day 11 checklist
+
+- [ ] `django-filter` installed, `django_filters` in `INSTALLED_APPS`
+- [ ] `PostFilter` supports `category`, `author`, `status`, and date range
+- [ ] `?search=` works across title, body, author, and category
+- [ ] `?ordering=` works on whitelisted fields only
+- [ ] Pagination returns `count`, `next`, `previous`, `results` at 10 per page
+- [ ] `page_size` customizable but capped
+- [ ] `?search=x&category=y&page=2` works fully, with `next` preserving the filters
+- [ ] Can explain why the ordering needs a tiebreaker
+- [ ] Verified query count doesn't grow with page size
+- [ ] Wrote and ran the filter and pagination tests
+
+## Common gotchas
+
+- **`django_filters` not in `INSTALLED_APPS`**: filters work, but the browsable API's filter form fails with a template error.
+- **Typing `django_filter` instead of `django_filters`**: `ModuleNotFoundError`.
+- **Importing `FilterSet` from the wrong place**: for DRF, use `django_filters.rest_framework.DjangoFilterBackend` as the backend. `django_filters.FilterSet` is fine for the class itself.
+- **Filters silently ignored**: you overrode `list()` without calling `filter_queryset`, or forgot `filter_backends` / `filterset_class` on the view.
+- **Inflated counts after filtering by category**: you dropped `distinct=True` from the `Count()` annotations.
+- **Duplicates in results**: filtering across a to-many relation without `distinct`. `SearchFilter` handles this itself, but a custom `method=` filter may not.
+- **`UnorderedObjectListWarning`**: paginating a queryset with no ordering. Set `ordering` on the view or `Meta.ordering` on the model.
+- **Pages overlapping or skipping rows**: ordering by a non-unique field alone. Always add `id` as the final tiebreaker.
+- **Clients break after enabling pagination**: the response is now an object with `results`, not a list. Tell consumers first.
+- **Allowing `page_size` without `max_page_size`**: one request can pull the whole table.
+- **Searching `TextField` with `icontains` on huge tables**: slow. Profile before adding more fields.
+- **Treating filters as security**: `?status=draft` narrows results but doesn't grant access. Visibility belongs in `get_queryset()` and permissions, as on Day 9.
+- **`ordering_fields = "__all__"`**: lets clients sort on any column, including unindexed or sensitive ones. Whitelist explicitly.
+
+Day 12 is typically testing the API properly (`APITestCase`, factories, coverage), or caching and throttling. Want that outline next?
