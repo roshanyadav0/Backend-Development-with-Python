@@ -1,0 +1,487 @@
+# Day 12: Django Signals
+
+## Part 1: What signals are
+
+A signal is Django's built-in **observer pattern**. One piece of code announces "something happened" (the sender), and any number of other functions (receivers) react, without the sender knowing they exist.
+
+```
+Post.save()  ──►  post_save signal  ──►  receiver A (create profile)
+                                    ──►  receiver B (log it)
+```
+
+Built-in signals you'll meet most:
+
+| Signal | Fires | Useful extras |
+|---|---|---|
+| `pre_save` / `post_save` | before / after `Model.save()` | `created`, `raw`, `update_fields` |
+| `pre_delete` / `post_delete` | before / after a row is deleted | `instance` |
+| `m2m_changed` | when a ManyToMany relation changes (`.add()`, `.remove()`, `.clear()`) | `action`, `pk_set` |
+| `request_started` / `request_finished` | around every HTTP request | rarely needed |
+
+Facts that shape everything below:
+
+- Receivers run **synchronously, in the same thread and database transaction** as the sender. A slow receiver slows the request.
+- If a receiver raises, the exception propagates to the sender (with `send()`), and the whole operation can fail.
+- Receivers run in no guaranteed useful order, so never depend on one receiver running before another.
+
+## Part 2: When to use signals, and when not to
+
+The default answer is **don't**. Reach for a signal only when it earns its keep.
+
+| Situation | Better tool |
+|---|---|
+| Logic about the model's own data | Override `save()` or add a model method |
+| Logic specific to one endpoint | Put it in the view, `perform_create`, or the serializer |
+| Reusable business operation | A plain function (`publish_post(post)`) called explicitly |
+| Slow work (email, images, third-party APIs) | A background task queue (Celery, RQ), triggered explicitly |
+| **Reacting to a model you don't own** (e.g. `User`) | **Signal** |
+| **Same reaction needed from many entry points** (admin, API, shell, `createsuperuser`) | **Signal** |
+| **A decoupled app listening to another app's events** | **Signal** |
+
+The profile example below passes this test: a `User` can be created from the admin, the register API, `createsuperuser`, and the shell. A signal catches all of them. Remembering to create a profile at each entry point would eventually fail.
+
+### What signals don't catch
+
+These skip `save()`, so **they don't fire `pre_save`/`post_save`**:
+
+- `QuerySet.update()`
+- `QuerySet.bulk_create()` and `bulk_update()`
+- Raw SQL
+
+This already bit you on Day 5: the "Publish selected posts" action uses `.update()`. We'll fix that below.
+
+## Part 3: Where signal code lives
+
+Three files, and the split matters:
+
+```
+posts/
+├── signals.py     # custom Signal() definitions ONLY (no model imports)
+├── receivers.py   # all @receiver functions
+└── apps.py        # connects receivers.py at startup
+```
+
+Why separate `signals.py` from `receivers.py`? `models.py` will import the custom signal to send it, and receivers import models. Keeping the signal definition free of model imports avoids a circular import.
+
+**posts/apps.py**
+```python
+from django.apps import AppConfig
+
+
+class PostsConfig(AppConfig):
+    default_auto_field = "django.db.models.BigAutoField"
+    name = "posts"
+
+    def ready(self):
+        from . import receivers  # noqa: F401  (importing registers the receivers)
+```
+
+Receivers only exist once their module is imported. `ready()` runs once at startup after all apps are loaded, so it's the standard place to import them. If you forget this step, nothing errors; the signals just never fire. Django auto-detects a single `AppConfig` in `apps.py`, so `"posts"` in `INSTALLED_APPS` is still enough.
+
+## Part 4: `post_save`, auto-create a user profile
+
+Add a `Profile` model to **posts/models.py**. (A real project would put it in an `accounts` app, but we're keeping the setup small.)
+
+```python
+class Profile(models.Model):
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="profile"
+    )
+    bio = models.TextField(blank=True)
+    website = models.URLField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"Profile of {self.user}"
+```
+
+```bash
+python manage.py makemigrations
+python manage.py migrate
+```
+
+**posts/receivers.py**
+```python
+import logging
+
+from django.conf import settings
+from django.db.models.signals import post_save, pre_delete
+from django.dispatch import receiver
+
+from .models import Post, Profile
+
+logger = logging.getLogger(__name__)
+
+
+@receiver(post_save, sender=settings.AUTH_USER_MODEL, dispatch_uid="create_user_profile")
+def create_user_profile(sender, instance, created, raw=False, **kwargs):
+    if created and not raw:
+        Profile.objects.create(user=instance)
+```
+
+Line by line:
+
+- **`@receiver(signal, sender=...)`** connects the function. Without `sender`, it would run for *every* model's save.
+- **`sender=settings.AUTH_USER_MODEL`** works as a lazy `"app_label.Model"` string for model signals, matching the Day 3 habit of never importing `User` directly.
+- **`created`** is `True` only for the INSERT, not later updates. Without this guard you'd try to create a second profile on every user save (and hit the `OneToOne` unique constraint).
+- **`raw`** is `True` when Django is loading fixtures (`loaddata`). The fixture already contains related rows, so creating a profile would duplicate them.
+- **`**kwargs` is mandatory.** Django passes extra arguments (`signal`, `using`, `update_fields`), and omitting `**kwargs` raises a `TypeError` as soon as the signal fires.
+- **`dispatch_uid`** is a unique string that prevents a receiver registering twice if its module gets imported through two paths. It's a cheap safeguard.
+
+### Backfill existing users
+
+Users from earlier days have no profile. Use `bulk_create` (which, fittingly, doesn't fire signals):
+
+```python
+from django.contrib.auth import get_user_model
+from posts.models import Profile
+
+User = get_user_model()
+missing = User.objects.filter(profile__isnull=True)
+Profile.objects.bulk_create([Profile(user=u) for u in missing])
+```
+
+### Try it
+
+```python
+>>> u = User.objects.create_user("dave", password="pass12345")
+>>> u.profile
+<Profile: Profile of dave>
+```
+
+Now register through `POST /api/auth/register/` (Day 10) and check the profile exists, without touching `RegisterSerializer`. That's the decoupling benefit.
+
+### The signal-free alternative (compare honestly)
+
+```python
+# in RegisterSerializer.create()
+user = User.objects.create_user(**validated_data)
+Profile.objects.create(user=user)
+```
+
+It's explicit and easy to trace, but it only covers the API. Users created in the admin or by `createsuperuser` get no profile. That gap is why this case justifies a signal.
+
+## Part 5: `pre_delete`, react before data disappears
+
+When a `Post` is deleted, the database `CASCADE` from Day 3 removes its comments and likes automatically. **You don't need a signal for deleting related database rows.** Signals earn their place for things the database can't do for you: audit logs, cache invalidation, deleting files from disk.
+
+The difference between the two delete signals:
+
+- **`pre_delete`**: related rows **still exist**, so you can inspect them.
+- **`post_delete`**: the row (and its cascaded children) are gone.
+
+Add to **posts/receivers.py**:
+
+```python
+@receiver(pre_delete, sender=Post, dispatch_uid="log_post_deletion")
+def log_post_deletion(sender, instance, **kwargs):
+    logger.info(
+        "Deleting post id=%s %r by user_id=%s (%d comments, %d likes go with it)",
+        instance.pk,
+        instance.title,
+        instance.author_id,
+        instance.comments.count(),
+        instance.likes.count(),
+    )
+```
+
+(`author_id` avoids an extra query to load the author, the same trick as Day 10's permission.)
+
+To see the output, add a minimal logging config to **settings.py**:
+
+```python
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "handlers": {"console": {"class": "logging.StreamHandler"}},
+    "loggers": {"posts": {"handlers": ["console"], "level": "INFO"}},
+}
+```
+
+### A legitimate use: file cleanup
+
+If you later add an `ImageField` (say `Profile.avatar`), the database row is deleted but the file stays on disk. The standard fix:
+
+```python
+from django.db import transaction
+from django.db.models.signals import post_delete
+
+@receiver(post_delete, sender=Profile, dispatch_uid="delete_avatar_file")
+def delete_avatar_file(sender, instance, **kwargs):
+    if instance.avatar:
+        # Delete the file only if the DB transaction actually commits
+        transaction.on_commit(lambda: instance.avatar.delete(save=False))
+```
+
+`post_delete` is the right choice here (nothing needs to be inspected), and `on_commit` stops you destroying a file when the delete later rolls back.
+
+### Delete behavior to know
+
+- `instance.delete()` and `queryset.delete()` **both** fire the signals (Django loads the objects when listeners exist).
+- Cascades fire them too. Deleting a `User` fires `pre_delete` for every one of their posts, comments, and likes.
+- Bulk deleting 10,000 posts runs your receiver 10,000 times. Keep delete receivers cheap.
+
+## Part 6: A custom signal, `post_published`
+
+### Step 1: define it
+
+**posts/signals.py**
+```python
+from django.dispatch import Signal
+
+# Sent when a Post moves into the "published" state.
+# Sender: the Post class.  Arguments: post (the Post instance).
+post_published = Signal()
+```
+
+Since Django 4.0 there's no `providing_args`. Document the arguments in a comment.
+
+### Step 2: send it from one place
+
+The hard part is detecting the transition from draft to published, not the signal itself. Admin edits, API `PATCH`es, and your own code can all flip `status`. The one place they all pass through is `Post.save()`, so the logic goes there. **The signal only broadcasts; the model owns the rule.**
+
+**posts/models.py**
+```python
+from django.db import models, transaction
+from django.utils import timezone
+
+from .signals import post_published
+
+
+class Post(models.Model):
+    # ...fields and Meta as before...
+
+    def save(self, *args, **kwargs):
+        was_published = (
+            self.pk is not None
+            and Post.objects.filter(pk=self.pk, status=self.Status.PUBLISHED).exists()
+        )
+        if self.status == self.Status.PUBLISHED and self.published_at is None:
+            self.published_at = timezone.now()
+
+        super().save(*args, **kwargs)
+
+        if self.status == self.Status.PUBLISHED and not was_published:
+            transaction.on_commit(
+                lambda: post_published.send_robust(sender=type(self), post=self)
+            )
+```
+
+What each piece does:
+
+- **`was_published`** asks the database for the *previous* status (one extra query per save, acceptable here). A brand-new post created directly as published counts as a transition too.
+- **`published_at`** is now set automatically, so the admin action no longer needs to do it (see below).
+- **`transaction.on_commit`** delays the signal until the transaction commits. Otherwise a receiver could email "your post is live" and then the transaction rolls back. Outside a transaction it runs immediately.
+- **`send_robust`** catches receiver exceptions instead of raising them (Django logs them). A broken notification shouldn't turn a successful publish into a 500 after the data is already committed. Use plain `send()` when a receiver failing *should* abort the operation.
+
+### Step 3: add receivers
+
+**posts/receivers.py**, add:
+```python
+from django.core.mail import send_mail
+
+from .signals import post_published
+
+
+@receiver(post_published, sender=Post, dispatch_uid="log_post_published")
+def log_published(sender, post, **kwargs):
+    logger.info("Post %s published: %r", post.pk, post.title)
+
+
+@receiver(post_published, sender=Post, dispatch_uid="email_author_published")
+def email_author(sender, post, **kwargs):
+    if post.author.email:
+        send_mail(
+            subject=f'Your post "{post.title}" is live',
+            message=f"Hi {post.author.username}, your post was published.",
+            from_email=None,                      # uses DEFAULT_FROM_EMAIL
+            recipient_list=[post.author.email],
+        )
+```
+
+For local learning, print emails to the terminal by adding this to **settings.py**:
+
+```python
+EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
+```
+
+Two receivers on one signal show the pattern's point: you can add more reactions (cache clearing, a webhook) without touching the publishing code.
+
+### Step 4: fix the Day 5 admin action
+
+`.update()` bypasses `save()`, so it would publish posts silently with no signal. Loop and save instead:
+
+```python
+@admin.action(description="Publish selected posts")
+def make_published(self, request, queryset):
+    count = 0
+    for post in queryset.exclude(status=Post.Status.PUBLISHED):
+        post.status = Post.Status.PUBLISHED
+        post.save()          # sets published_at and fires post_published
+        count += 1
+    self.message_user(request, f"{count} post(s) published.", messages.SUCCESS)
+```
+
+This trades speed for correctness. On Day 5 the one-query `.update()` was right. Once side effects depend on `save()`, you have to pay for it. Note that the loop emails one author per post, synchronously, which is exactly the "slow receiver" problem. A task queue solves this in production.
+
+## Part 7: Test it
+
+Add to **posts/tests.py**:
+
+```python
+from django.contrib.auth import get_user_model
+from django.core import mail
+from django.test import TestCase
+
+from .models import Post, Profile
+from .signals import post_published
+
+User = get_user_model()
+
+
+class SignalTests(TestCase):
+    def setUp(self):
+        self.author = User.objects.create_user(
+            "alice", email="alice@example.com", password="pass12345"
+        )
+
+    def make_post(self, **kwargs):
+        defaults = dict(author=self.author, title="A draft post", slug="a-draft", body="x" * 60)
+        defaults.update(kwargs)
+        return Post.objects.create(**defaults)
+
+    def test_profile_created_with_user(self):
+        self.assertTrue(Profile.objects.filter(user=self.author).exists())
+
+    def test_profile_not_duplicated_on_user_update(self):
+        self.author.first_name = "Alice"
+        self.author.save()
+        self.assertEqual(Profile.objects.filter(user=self.author).count(), 1)
+
+    def test_signal_fires_once_on_publish(self):
+        received = []
+
+        def handler(sender, post, **kwargs):
+            received.append(post.pk)
+
+        post_published.connect(handler)
+        self.addCleanup(post_published.disconnect, handler)
+
+        post = self.make_post()                       # draft: no signal
+        self.assertEqual(received, [])
+
+        with self.captureOnCommitCallbacks(execute=True):
+            post.status = Post.Status.PUBLISHED
+            post.save()
+        self.assertEqual(received, [post.pk])
+        self.assertIsNotNone(post.published_at)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            post.save()                               # already published: no signal
+        self.assertEqual(received, [post.pk])
+
+    def test_author_is_emailed_on_publish(self):
+        post = self.make_post()
+        with self.captureOnCommitCallbacks(execute=True):
+            post.status = Post.Status.PUBLISHED
+            post.save()
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, ["alice@example.com"])
+
+    def test_bulk_update_does_not_fire(self):
+        self.make_post()
+        with self.captureOnCommitCallbacks(execute=True):
+            Post.objects.update(status=Post.Status.PUBLISHED)
+        self.assertEqual(len(mail.outbox), 0)         # the gotcha, proven
+
+    def test_delete_is_logged(self):
+        post = self.make_post()
+        with self.assertLogs("posts", level="INFO") as logs:
+            post.delete()
+        self.assertTrue(any("Deleting post" in line for line in logs.output))
+```
+
+```bash
+python manage.py test posts
+```
+
+Why `captureOnCommitCallbacks(execute=True)`? Django's `TestCase` wraps each test in a transaction that never commits, so `on_commit` callbacks would silently never run. This helper (Django 3.2+) runs them for you.
+
+## Part 8: Try it
+
+```bash
+python manage.py runserver
+```
+
+1. Register through the API and confirm `user.profile` exists.
+2. Create a draft post in the admin (give the author an email). Change its status to **Published** and save. Watch the terminal for the log line and the console email.
+3. Save the same post again. Nothing fires.
+4. Use the "Publish selected posts" action on two drafts. Two emails.
+5. Delete a post. The `pre_delete` log shows how many comments and likes went with it.
+
+## Part 9: The warning, signals make code harder to trace
+
+Signals are powerful because the sender doesn't know who's listening. That is also their main cost.
+
+- **Hidden control flow.** Reading `post.save()` tells you nothing about the email that gets sent. A new developer has to search the codebase for receivers.
+- **Hard to debug.** The stack trace of a failing receiver points through Django internals. "Why is this slow?" can turn out to be a receiver someone added two months ago.
+- **Silent non-firing.** Forget the `ready()` import, or use `.update()` or `bulk_create`, and nothing happens with no error.
+- **Surprise side effects in tests and scripts.** Creating a `User` in a data-import script now also writes a `Profile` row and runs anything else attached.
+- **Ordering and coupling.** Receivers shouldn't depend on each other, but they often start to.
+- **Transaction and failure semantics.** A receiver exception can abort the sender's operation, and a receiver that uses `post_save` can run before the transaction commits.
+
+Rules of thumb:
+
+1. Prefer an **explicit function call** when you control both sides.
+2. Use a signal when the sender is **code you don't own** or **many entry points** need the same reaction.
+3. Keep receivers **small, fast, and idempotent**, and push heavy work to a background task.
+4. Put receivers in **one predictable file** (`receivers.py`), and give each a `dispatch_uid` and a docstring.
+5. For anything beyond logging and bookkeeping, ask: "would a function I call explicitly be clearer?" Usually yes.
+
+## Experiments (20 min)
+
+1. Comment out the `ready()` import, create a user, and see no profile appear. Restore it.
+2. Run `Post.objects.filter(status="draft").update(status="published")` in the shell and confirm no email and no signal. Then publish the same way through `post.save()`.
+3. Make `email_author` raise an exception. With `send_robust`, the publish still succeeds. Switch `models.py` to `send` and see the failure propagate.
+4. Delete a user with several posts and read the stack of `pre_delete` log lines.
+5. Run `post_save.has_listeners(sender=Post)` in the shell. It's your first way to inspect what's connected.
+6. Add a `time.sleep(2)` to `email_author` and publish via the admin action on 3 posts. Feel the cost of synchronous receivers.
+
+## Stretch goals
+
+- Add a `ProfileInline` to the user admin (`admin.StackedInline` with `can_delete = False`; unregister and re-register `User`'s admin).
+- Add `GET /api/auth/me/` returning the user with their profile.
+- Write an `m2m_changed` receiver on `Post.categories.through` that logs added and removed categories (check `action == "post_add"` and use `pk_set`).
+- Notify a post's author on a new comment two ways, a `post_save` receiver and an explicit call in `CommentViewSet.perform_create`, and compare traceability.
+- Rewrite `email_author` to write to an `Outbox` table instead, imitating how a real task queue would pick work up.
+
+## Day 12 checklist
+
+- [ ] Can explain what a signal is, and name three built-in ones
+- [ ] `Profile` model with migration, backfilled for existing users
+- [ ] `post_save` receiver creates profiles using `created` and `raw` guards
+- [ ] Receivers registered through `AppConfig.ready()`
+- [ ] `pre_delete` logs related counts before cascade
+- [ ] Custom `post_published` signal defined in `signals.py`
+- [ ] `Post.save()` detects the draft to published transition and sends via `on_commit`
+- [ ] Admin action fixed so it no longer uses `.update()`
+- [ ] Signal tests pass, including the bulk-update proof
+- [ ] Can name three costs of signals and when you'd skip them
+
+## Common gotchas
+
+- **Receiver never runs**: the module isn't imported. Check `apps.py` `ready()` and that `INSTALLED_APPS` uses the app (not a path without the config).
+- **`TypeError: ... got an unexpected keyword argument`**: your receiver lacks `**kwargs`.
+- **Infinite recursion**: calling `instance.save()` inside a `post_save` receiver for the same model triggers itself. Use `.update()` on the queryset, or compute the value in `pre_save` or `save()`.
+- **Duplicate side effects** (two emails): the receiver module is imported twice. Add `dispatch_uid`.
+- **`IntegrityError` on `Profile`**: no `created` check, or `bulk_create`/fixtures creating profiles that the signal then tries to duplicate (`raw`).
+- **Signals not firing for `update()`, `bulk_create()`, `bulk_update()`**: by design. Loop and `save()`, or call the logic explicitly.
+- **`on_commit` callbacks never run in tests**: wrap the action in `self.captureOnCommitCallbacks(execute=True)`, or use `TransactionTestCase`.
+- **Circular import** between `models.py` and the receivers: keep `Signal()` definitions in `signals.py` with no model imports, and receivers in a separate file.
+- **Signal sent but receiver connected with `sender=Post` doesn't match**: you sent with a different `sender`. Always pass `sender=type(self)` or the class.
+- **Weak references**: receivers are held weakly by default, so lambdas and local functions can be garbage-collected. Define production receivers at module level.
+- **`published_at` not saved with `save(update_fields=[...])`**: `update_fields` limits what's written, so include `"published_at"` or avoid `update_fields` on this model.
+- **Doing heavy work in a receiver**: it runs inside the request. Hand slow work to a task queue.
+- **Receiver exceptions breaking a save**: with `send()` they propagate. Use `send_robust()` for fire-and-forget notifications.
+
+Day 13 is likely a week 2 review like Day 6 (rebuild, query, and API drills from memory) or API testing and coverage. Want that outline next?
