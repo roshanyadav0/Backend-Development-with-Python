@@ -1,0 +1,348 @@
+# Day 13: Review Week 2
+
+Same rules as Day 6: **close the old notes, build from memory, then check.** This week was more moving parts (serializers, viewsets, auth, filters, signals), so today is about wiring them together without help.
+
+## Part 0: One correction from Day 11
+
+One of my Day 11 tests is wrong. `test_search` uses `?search=number 7`, but that matches both "Post number 7" and "Post number 17", because each term only has to appear somewhere. The count is 2, not 1. Change it to:
+
+```python
+def test_search(self):
+    r = self.client.get("/api/posts/?search=number 17")
+    self.assertEqual(r.data["count"], 1)
+```
+
+This is a good reminder of the "terms are ANDed, each matches any field" rule. If you hit this failure, you were learning it correctly.
+
+## Part 1: Rebuild the Blog API from scratch (90 min)
+
+Start a **fresh project** so you can't copy your old files:
+
+```bash
+mkdir blog_review && cd blog_review
+python -m venv venv && source venv/bin/activate
+pip install django djangorestframework django-filter
+django-admin startproject config .
+python manage.py startapp blog
+```
+
+### Spec (don't look at Days 7 to 12)
+
+**Models**: `Category`, `Post`, `Comment`, `Like`, with `Post.status` as `TextChoices`.
+
+**Endpoints**
+
+| Endpoint | Behavior |
+|---|---|
+| `POST /api/auth/register/` | creates user, returns token |
+| `POST /api/auth/login/` | returns token |
+| `GET /api/posts/` | list, paginated 10/page, `?page_size` capped at 50 |
+| `POST /api/posts/` | create (auth required), author from `request.user` |
+| `GET/PUT/PATCH/DELETE /api/posts/{slug}/` | detail by slug; only the author or staff can modify |
+| `POST /api/posts/{slug}/like/` | like a post (idempotent) |
+| `GET/POST /api/posts/{slug}/comments/` | list and create comments |
+| `GET /api/posts/?search=&category=&ordering=` | search, category filter, ordering |
+
+**Rules**
+- Anonymous users can read published posts only.
+- Authenticated users also see their own drafts.
+- Title must be at least 5 characters. A published post needs a body of at least 50 characters.
+- The list serializer is lighter than the detail serializer.
+- `comment_count` and `like_count` must not cause N+1 queries.
+- A custom signal fires when a post becomes published.
+
+### Suggested order (time-box each)
+
+1. Models, migrations, admin registration (15 min)
+2. Serializers: list, detail, comment, register (15 min)
+3. `PostViewSet`, `CommentViewSet`, router, URLs (20 min)
+4. Token auth settings and login/register/logout (10 min)
+5. `IsAuthorOrReadOnly` (5 min)
+6. `FilterSet`, search, ordering, pagination (15 min)
+7. Signal for publishing (10 min)
+
+If you get stuck for more than 10 minutes, note the gap in `NOTES.md` and **then** look it up. Writing the gap down first is what makes the lookup stick.
+
+### Self-check rubric
+
+**Models and admin**
+- [ ] `settings.AUTH_USER_MODEL`, `on_delete`, `related_name` everywhere
+- [ ] `UniqueConstraint` on `Like`
+- [ ] `ModelAdmin` with `list_display`, `list_filter`, `search_fields`
+
+**Serializers**
+- [ ] `fields` is an explicit list (no `"__all__"`)
+- [ ] `author` is read-only, set in `perform_create`
+- [ ] Nested comments are `read_only=True`
+- [ ] Both `validate_title` and object-level `validate()` return their values
+- [ ] `validate()` falls back to `self.instance` for PATCH
+
+**Views and routing**
+- [ ] `basename` passed to `router.register`
+- [ ] `get_queryset()` uses `select_related`, `prefetch_related`, and `annotate(..., distinct=True)`
+- [ ] `get_serializer_class()` picks list vs detail
+- [ ] Comments scoped to the post in `get_queryset`
+- [ ] `like` action uses `get_or_create` and `slug=None`
+
+**Auth and permissions**
+- [ ] `rest_framework.authtoken` in `INSTALLED_APPS` and migrated
+- [ ] `TokenAuthentication` listed **first** (so anonymous gets 401, not 403)
+- [ ] `IsAuthenticatedOrReadOnly` as the global default
+- [ ] `has_object_permission` compares `obj.author_id` to `request.user.id`
+
+**Filtering and pagination**
+- [ ] `django_filters` (with an s) in `INSTALLED_APPS`
+- [ ] Ordering has an `-id` tiebreaker
+- [ ] `max_page_size` set
+- [ ] `ordering_fields` is a whitelist
+
+**Signals**
+- [ ] Receivers imported in `AppConfig.ready()`
+- [ ] `**kwargs` on every receiver, `dispatch_uid` set
+- [ ] Signal sent through `transaction.on_commit`
+
+Scoring: 24 or more ticked is solid. Under 18 means rebuild again in two days, focusing on the section where you lost the most points.
+
+## Part 2: Test everything in the browsable API (30 min)
+
+Seed it first: 25+ posts across 3 categories, 2 normal users, 1 staff user, and some drafts. Then work through this table, writing down the **status code you expect before you click**:
+
+| # | Action | Expected |
+|---|---|---|
+| 1 | Anonymous `GET /api/posts/` | 200, published only |
+| 2 | Anonymous `POST /api/posts/` | 401 (with token auth first) |
+| 3 | Login, then `POST` with a 3-character title | 400 with a title error |
+| 4 | `POST` valid data | 201, author is you |
+| 5 | `POST` status `published` with a 20-char body | 400 on `body` |
+| 6 | `PATCH` your own post's title | 200 |
+| 7 | `PATCH` someone else's post | 403 with your custom message |
+| 8 | `DELETE` someone else's post as staff | 204 |
+| 9 | `GET /api/posts/?page=2` | 200, `previous` is set |
+| 10 | `GET /api/posts/?page=999` | 404 |
+| 11 | `GET /api/posts/?category=nope` | 400 |
+| 12 | `?search=orm&category=django&page=2` | `next` keeps both filters |
+| 13 | `?ordering=-like_count` | most liked first |
+| 14 | `POST .../like/` twice | 201, then 200 |
+| 15 | `POST .../comments/` on a nonexistent slug | 404 |
+| 16 | Bad token in the header | 401 `Invalid token.` |
+| 17 | Another user's draft, via `/api/posts/{slug}/` | 404 |
+| 18 | Publish a draft, check the console log and email | signal fired once |
+
+Score yourself on how many status codes you predicted correctly. Anything you got wrong is a gap worth a line in your notes.
+
+Then lock the behavior in with tests. Write at least these without looking:
+
+```python
+class ReviewTests(APITestCase):
+    def test_anon_write_is_401(self): ...
+    def test_author_only_edit(self): ...
+    def test_list_query_count_is_constant(self):
+        with self.assertNumQueries(N):   # find N yourself, then assert it
+            self.client.get("/api/posts/")
+    def test_pagination_cap(self): ...
+    def test_draft_hidden_from_other_users(self): ...
+```
+
+`assertNumQueries` is the sharpest tool here. Create 5 posts, record N, then create 20 more and confirm N hasn't changed.
+
+## Part 3: Write a custom permission without the docs (15 min)
+
+Close everything and write each one. Use a scratch file.
+
+1. **`IsAuthorOrReadOnly`**: anyone can read; only the author (or staff) modifies.
+2. **`IsAdminOrReadOnly`**: anyone can read; only staff writes. This is for a `CategoryViewSet`.
+3. **`IsOwnerOfLike`**: a `Like` has `user`, not `author`; only that user can delete it.
+4. **`CanCommentOnPublished`**: block `POST` to comments when the post is a draft.
+5. **Bonus**: a permission with a custom `message`.
+
+<details>
+<summary>Answers</summary>
+
+```python
+from rest_framework import permissions
+
+
+class IsAuthorOrReadOnly(permissions.BasePermission):
+    message = "You can only modify your own content."
+
+    def has_permission(self, request, view):
+        return (
+            request.method in permissions.SAFE_METHODS
+            or bool(request.user and request.user.is_authenticated)
+        )
+
+    def has_object_permission(self, request, view, obj):
+        if request.method in permissions.SAFE_METHODS:
+            return True
+        return request.user.is_staff or obj.author_id == request.user.id
+
+
+class IsAdminOrReadOnly(permissions.BasePermission):
+    def has_permission(self, request, view):
+        return request.method in permissions.SAFE_METHODS or bool(
+            request.user and request.user.is_staff
+        )
+
+
+class IsOwnerOfLike(permissions.BasePermission):
+    def has_object_permission(self, request, view, obj):
+        if request.method in permissions.SAFE_METHODS:
+            return True
+        return obj.user_id == request.user.id
+
+
+class CanCommentOnPublished(permissions.BasePermission):
+    message = "You cannot comment on an unpublished post."
+
+    def has_permission(self, request, view):
+        if request.method == "POST":
+            post = view.get_post()
+            return post.status == post.Status.PUBLISHED
+        return True
+```
+</details>
+
+**Check yourself**
+
+1. When does `has_object_permission` run, and when does it not? (Only when the view calls `get_object()` or `check_object_permissions`; never on `list` or `create`.)
+2. Why pair it with `IsAuthenticated`, or write `has_permission` yourself? (Because the object check never runs on `create`, and anonymous users would otherwise reach the view.)
+3. Why `obj.author_id` instead of `obj.author`? (No extra query to load the author.)
+4. What does `IsAdminUser` actually check? (`is_staff`, not `is_superuser`.)
+5. A user gets 403 where you expected 401. What's the likely cause? (`SessionAuthentication` listed first, so there's no `WWW-Authenticate` challenge header.)
+
+If you got 1, 2, and 5 right, you understand the part most people get wrong.
+
+## Part 4: DRF ViewSet vs FastAPI route
+
+Since you already compared the ORMs on Day 6, here's the framework-level comparison. They solve overlapping problems from opposite directions: DRF is **batteries included**, and FastAPI is **type-driven and minimal**.
+
+### The same endpoint in FastAPI
+
+```python
+from fastapi import Depends, FastAPI, HTTPException, Query
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import select
+from sqlalchemy.orm import Session, selectinload
+
+app = FastAPI()
+
+
+class PostOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    title: str
+    slug: str
+
+
+class PostUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=5)
+    body: str | None = None
+
+
+@app.get("/posts", response_model=list[PostOut])
+def list_posts(
+    search: str | None = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, le=50),
+    db: Session = Depends(get_db),
+):
+    stmt = select(Post).order_by(Post.created_at.desc(), Post.id.desc())
+    if search:
+        stmt = stmt.where(Post.title.ilike(f"%{search}%"))
+    stmt = stmt.limit(page_size).offset((page - 1) * page_size)
+    return db.scalars(stmt).all()
+
+
+@app.patch("/posts/{slug}", response_model=PostOut)
+def update_post(
+    slug: str,
+    data: PostUpdate,
+    user: User = Depends(get_current_user),   # you write this (JWT/OAuth2)
+    db: Session = Depends(get_db),
+):
+    post = db.scalar(select(Post).where(Post.slug == slug))
+    if post is None:
+        raise HTTPException(404, "Not found.")
+    if post.author_id != user.id and not user.is_staff:
+        raise HTTPException(403, "You can only modify your own content.")
+    for field, value in data.model_dump(exclude_unset=True).items():
+        setattr(post, field, value)
+    db.commit()
+    return post
+```
+
+Compare that with DRF's `PostViewSet`, where the equivalent is `queryset`, `serializer_class`, `filterset_class`, and `permission_classes`.
+
+### What's easier in each
+
+| Area | DRF | FastAPI |
+|---|---|---|
+| **Standard CRUD** | **Much easier.** One `ModelViewSet` plus a router gives six endpoints | You write every route, query, and 404 check |
+| **Admin, auth, users** | **Built in** (admin, sessions, permissions, tokens) | You assemble it (OAuth2/JWT helpers, your own user table, SQLAdmin or similar) |
+| **Filtering, search, pagination** | **Plug-ins** (`django-filter`, `SearchFilter`, paginators) | Hand-written, or libraries like `fastapi-pagination` |
+| **Migrations** | `makemigrations`, built in | Alembic, configured yourself |
+| **Request validation** | Serializer classes, with more ceremony | **Easier.** Type hints are the validation (Pydantic), with no separate class per concern |
+| **API docs** | Needs `drf-spectacular` or similar | **Automatic**, interactive at `/docs` |
+| **Async and concurrency** | Possible (async views exist) but the ORM and ecosystem are mostly sync | **Native.** Built for `async def` and high concurrency |
+| **Dependency injection** | Permission classes, mixins, and `get_queryset` hooks | **`Depends()`** is explicit, composable, and easy to test or override |
+| **Per-endpoint flexibility** | Fighting the viewset abstraction when you leave CRUD | **Easier.** Each route is just a function |
+| **Editor support and type safety** | Dynamic; serializer fields aren't type-checked | **Better.** Types flow from the request to the response model |
+| **Learning curve** | Many concepts (serializers, viewsets, routers, backends) before the first thing works | Smaller; the first endpoint takes a few lines |
+| **Conventions** | Strong, consistent across projects | Few; project structure is up to you, so codebases vary |
+| **Maturity of the ecosystem** | Very mature, with huge numbers of packages | Younger, but growing fast |
+
+### Where the abstractions differ
+
+1. **Serializer vs Pydantic model.** A DRF `ModelSerializer` is generated from the model and also handles saving (`create`/`update`). Pydantic models are pure validation and shape. Persisting is your job, and with SQLAlchemy the ORM model and API schema are separate classes you keep in sync.
+2. **Permissions vs dependencies.** DRF has a fixed two-hook permission system (`has_permission`, `has_object_permission`). In FastAPI, auth is just a dependency that either returns a user or raises, and object-level checks are ordinary `if` statements. That's simpler but easier to forget.
+3. **Router vs decorators.** DRF generates URLs from a viewset. FastAPI maps a URL to a function you write, and that explicitness is both its strength and its cost.
+4. **Session and transactions.** In DRF the ORM handles connections implicitly. In FastAPI you manage the SQLAlchemy `Session` through a `get_db` dependency, which ties back to Day 6's comparison.
+
+### Rule of thumb
+
+- Choose **DRF** for a CRUD-heavy product with an admin, users, and relational data where you want to ship quickly.
+- Choose **FastAPI** for microservices, ML or async-heavy workloads, thin APIs over existing data, or when you want typed, auto-documented endpoints and are happy to assemble the rest.
+
+### Optional exercise (45 min)
+
+Build just `GET /posts` and `PATCH /posts/{slug}` in FastAPI against the same SQLite database, using SQLAlchemy reflection or a copy of the models. Note where you write code that DRF gave you free, and where DRF made you write more than FastAPI would have. Add those observations to your notes.
+
+## Part 5: Gap list (10 min)
+
+Write three lines in `NOTES.md`, as on Day 6:
+
+1. **One thing I got wrong or forgot** (e.g., `basename`, `-id` tiebreaker, the `**kwargs` on a receiver).
+2. **One thing I want to understand more deeply** (e.g., how `captureOnCommitCallbacks` works, or why `distinct=True` fixes inflated counts).
+3. **One thing I could teach someone else.**
+
+Then take your single worst miss and **print the SQL** (`print(qs.query)`) or read the traceback slowly. Most misunderstandings show up there.
+
+## Stretch goals
+
+- Run `python manage.py test --parallel` and look at the slowest tests.
+- Install `django-debug-toolbar` and compare its query count against `assertNumQueries`.
+- Add `drf-spectacular` and generate an OpenAPI page. This closes the biggest DRF vs FastAPI documentation gap.
+- Add throttling on the login endpoint only (`throttle_classes`).
+- Add a `CategoryViewSet` using `IsAdminOrReadOnly`.
+
+## Day 13 checklist
+
+- [ ] Rebuilt the API in a fresh project with no notes
+- [ ] Scored yourself against the rubric
+- [ ] Ran all 18 browsable API checks and predicted the status codes first
+- [ ] Wrote the 5 review tests, including `assertNumQueries`
+- [ ] Wrote 4 custom permissions from memory
+- [ ] Wrote your own DRF vs FastAPI comparison before reading mine
+- [ ] Wrote the 3-line gap list
+- [ ] Fixed the Day 11 `test_search` correction
+
+## Common gotchas
+
+- **Peeking too early.** Ten real minutes of struggle beats reading the answer after two.
+- **Rebuilding in the old project.** You'll copy-paste from memory of your own files. Use a fresh one.
+- **Calling a signal test "passing" without `captureOnCommitCallbacks`.** The test can pass because the callback never ran.
+- **Testing only the happy path.** Half of today's value is the 401, 403, 400, and 404 cases.
+- **Comparing frameworks by feature count.** Compare by what you'd have to write yourself, which is what actually costs time.
+- **Treating filters as security.** Visibility belongs in `get_queryset()` and permissions.
+
+Day 14 would normally be the end-of-block checkpoint or the start of a new topic (testing with factories, caching, or Celery for the slow-signal problem from Day 12). Want that outline next?
