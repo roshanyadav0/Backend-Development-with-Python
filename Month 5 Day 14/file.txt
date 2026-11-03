@@ -1,0 +1,353 @@
+# Day 14: Redis Fundamentals
+
+## Part 1: What Redis is
+
+Redis is an **in-memory data structure server**. It's not just a key-value cache: each value has a type (string, hash, list, set, sorted set...), and Redis gives you atomic commands for that type. You don't fetch a list, modify it in Python, and write it back. You tell Redis `LPUSH` and it does it.
+
+Where it fits in your blog project:
+
+| Use | Redis feature |
+|---|---|
+| Caching expensive queries (post list, counts) | strings + `EXPIRE` |
+| Like counters, view counters | `INCR` |
+| Rate limiting login attempts (Day 10's weakness) | `INCR` + `EXPIRE` |
+| Trending posts / leaderboards | sorted sets |
+| Background job queue (the Day 12 slow-receiver problem) | lists (and Celery's broker) |
+| Sessions | strings / hashes |
+
+Redis complements your relational database; it doesn't replace it. Postgres or SQLite remains the source of truth, and Redis holds data that's fast, temporary, or derived.
+
+## Part 2: Install and open the CLI
+
+**macOS (Homebrew)**
+```bash
+brew install redis
+brew services start redis        # background service
+# or foreground: redis-server
+```
+
+**Ubuntu / Debian / WSL**
+```bash
+sudo apt update && sudo apt install redis-server
+sudo service redis-server start  # or: redis-server
+```
+
+**Docker (works anywhere, easy to throw away)**
+```bash
+docker run -d --name redis -p 6379:6379 redis:7
+docker exec -it redis redis-cli
+```
+
+**Windows**: Redis isn't officially supported natively. Use WSL2 or Docker.
+
+Check it works:
+```bash
+redis-cli ping
+# PONG
+```
+
+Open the interactive shell with `redis-cli`. The prompt is `127.0.0.1:6379>`. Redis listens on port 6379 by default and has **16 numbered databases** (0 to 15). You start in `0`. Switch with `SELECT 1`.
+
+## Part 3: Strings, the base type
+
+A string is just bytes: text, a number, JSON, even an image up to 512 MB.
+
+```
+SET greeting "hello"
+GET greeting                  # "hello"
+SET greeting "hi" NX          # only set if the key does NOT exist (returns nil here)
+SET greeting "hi" XX          # only set if it DOES exist
+EXISTS greeting               # 1
+APPEND greeting " there"
+STRLEN greeting
+
+SET views:post:1 0
+INCR views:post:1             # 1   (atomic)
+INCRBY views:post:1 10        # 11
+DECR views:post:1
+GET views:post:1              # "10"  (stored as text, but INCR works on it)
+
+MSET a 1 b 2 c 3
+MGET a b c
+```
+
+**Key naming convention:** use colons to namespace, like `post:42:views`, `user:7:session`. Redis has no tables, so a consistent key scheme is your structure.
+
+`INCR` is atomic. If a thousand requests increment a counter at once, none is lost, unlike read-modify-write in Python, which has a race condition. This is the single most useful beginner feature.
+
+## Part 4: Expiry, TTL, DEL
+
+```
+SET otp:alice 482913 EX 60    # set with a 60-second expiry in one command
+TTL otp:alice                 # seconds left (e.g. 57)
+TTL greeting                  # -1  = exists, no expiry
+TTL nosuchkey                 # -2  = key doesn't exist
+EXPIRE greeting 30            # add expiry to an existing key
+PERSIST greeting              # remove the expiry
+PEXPIRE / PTTL                # same, in milliseconds
+DEL greeting                  # delete; returns number of keys removed
+UNLINK bigkey                 # delete in the background (for big values)
+```
+
+Gotchas:
+
+- `SET` on an existing key **clears its TTL**. If you update a cached value, set the TTL again (`SET key val EX 300`).
+- `EXPIRE` only applies to the whole key, not to individual elements inside a hash or set.
+- Expired keys are removed lazily (when accessed) plus a periodic background sweep. They stop being readable instantly, even if memory isn't freed yet.
+
+## Part 5: Hashes, an object with fields
+
+A hash is a mini-dictionary under one key. Good for objects.
+
+```
+HSET user:1 name "alice" email "alice@example.com" karma 10
+HGET user:1 name
+HGETALL user:1
+HMGET user:1 name email
+HINCRBY user:1 karma 5        # atomic counter inside the hash
+HDEL user:1 email
+HEXISTS user:1 name
+HLEN user:1
+```
+
+Why not a string with JSON? A hash lets you read or change one field without fetching and re-writing the whole object. Hashes hold flat values only (no nesting).
+
+## Part 6: Lists, ordered, duplicates allowed
+
+A linked list: fast at both ends, slow in the middle.
+
+```
+LPUSH recent:posts 5          # push to the head
+LPUSH recent:posts 6 7
+RPUSH recent:posts 1          # push to the tail
+LRANGE recent:posts 0 -1      # all items (-1 = last)
+LRANGE recent:posts 0 9       # first 10
+LLEN recent:posts
+LPOP recent:posts             # remove from head
+RPOP recent:posts
+LTRIM recent:posts 0 99       # keep only the first 100 items
+BRPOP jobs 0                  # BLOCKING pop: wait until an item arrives
+```
+
+Two classic patterns:
+
+- **Recent items feed**: `LPUSH` then `LTRIM 0 99` keeps a capped "last 100".
+- **Queue**: producer does `LPUSH jobs payload`, worker does `BRPOP jobs 0`. This is the idea behind task queues like Celery and RQ.
+
+## Part 7: Sets, unique, unordered
+
+```
+SADD post:1:likers alice bob carol
+SADD post:1:likers alice      # 0: already a member
+SISMEMBER post:1:likers bob   # 1
+SMEMBERS post:1:likers
+SCARD post:1:likers           # count: 3
+SREM post:1:likers carol
+
+SADD post:2:likers bob dave
+SINTER post:1:likers post:2:likers    # intersection: bob
+SUNION post:1:likers post:2:likers
+SDIFF post:1:likers post:2:likers     # in 1 but not 2
+```
+
+Compare to your `Like` table from Day 3, with its `UniqueConstraint` on `(post, user)`. A set gives you the same uniqueness for free, and `SISMEMBER` and `SCARD` are O(1). Don't run `SMEMBERS` on a huge set in production, since it returns everything at once. Use `SSCAN`.
+
+## Part 8: Sorted sets, unique members with a score
+
+Every member has a numeric **score**, and Redis keeps the set sorted by score.
+
+```
+ZADD trending 10 "post:1" 25 "post:2" 5 "post:3"
+ZINCRBY trending 1 "post:3"           # atomic score bump
+ZRANGE trending 0 -1 WITHSCORES                    # lowest to highest
+ZRANGE trending 0 2 REV WITHSCORES                 # top 3 (Redis 6.2+)
+ZREVRANGE trending 0 2 WITHSCORES                  # older form, still works
+ZRANK trending "post:1"                            # position (0-based, ascending)
+ZREVRANK trending "post:1"                         # position from the top
+ZSCORE trending "post:2"
+ZCARD trending
+ZREM trending "post:3"
+ZRANGEBYSCORE trending 10 +inf                     # score range
+```
+
+Use it for leaderboards, trending lists, and "top N" queries, which in SQL would mean `ORDER BY ... LIMIT` on every request. Here, every `ZINCRBY` keeps it sorted, and reading the top 10 is cheap.
+
+### Cheat sheet
+
+| Type | Think of it as | Typical use |
+|---|---|---|
+| String | a value | cache, counters, flags, tokens |
+| Hash | a dict / object | user profiles, small records |
+| List | a deque | queues, recent-items feeds |
+| Set | a `set()` | tags, unique likers, membership checks |
+| Sorted set | a set with scores | leaderboards, trending, scheduling by time |
+
+Inspect and debug:
+```
+TYPE greeting           # string / hash / list / set / zset
+KEYS user:*             # fine in dev, NEVER in production (blocks the server)
+SCAN 0 MATCH user:* COUNT 100   # the safe way: iterate in small steps
+DBSIZE
+INFO memory
+FLUSHDB                 # wipe the current database: careful!
+MONITOR                 # live stream of every command (great for learning)
+```
+
+Open a second terminal and run `redis-cli MONITOR` while you use Python in Part 10. You'll see each command arrive.
+
+## Part 9: Why Redis is fast
+
+1. **In memory.** RAM access is nanoseconds; disk is microseconds to milliseconds. Everything lives in memory, so there's no disk read on the hot path.
+2. **Simple data structures with good complexity.** `GET`, `SET`, `INCR`, `SADD`, and `HGET` are O(1). `ZADD` is O(log N). Operations are small and purpose-built.
+3. **Single-threaded command execution.** One thread runs commands one at a time. That sounds slow, but it removes lock contention, context switching, and race conditions. Each command is **atomic** by construction, which is why `INCR` is safe without you doing anything.
+4. **I/O multiplexing.** One thread can handle thousands of connections using `epoll`/`kqueue` (the same idea behind asyncio and Node). Redis 6+ can use extra threads for reading and writing network data, but commands still execute on one thread.
+5. **Efficient wire protocol.** RESP is a simple text/binary protocol that's cheap to parse.
+
+The trade-off: because commands run one at a time, **one slow command blocks everyone**. `KEYS *` on millions of keys, `SMEMBERS` on a giant set, or a long Lua script all freeze the server for that duration. That's why the "avoid `KEYS`" rule exists.
+
+Other trade-offs to know:
+
+- **Data must fit in RAM**, and RAM is expensive.
+- **Persistence is optional.** Redis can save to disk with RDB snapshots (periodic) or AOF (append every write), but by default treat it as **possibly lossy**. Don't make it the only copy of important data.
+- **It's not a query engine.** You look things up by key; there are no joins or `WHERE`. You design your keys around your read patterns.
+
+## Part 10: Connect from Python in 5 lines
+
+```bash
+pip install redis
+```
+
+```python
+import redis
+
+r = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+r.set("hello", "world", ex=60)
+print(r.get("hello"))        # world
+```
+
+`decode_responses=True` makes the client return `str` instead of `bytes`. Without it, `r.get("hello")` returns `b"world"`, a common surprise.
+
+Every CLI command is a method with the same name in lowercase:
+
+```python
+import redis
+
+r = redis.Redis(decode_responses=True)
+
+# Strings and counters
+r.set("views:post:1", 0)
+r.incr("views:post:1")
+r.incrby("views:post:1", 10)
+print(r.get("views:post:1"))                 # "11" (still a string; use int())
+print(r.ttl("hello"))
+
+# Hash
+r.hset("user:1", mapping={"name": "alice", "karma": 10})
+print(r.hgetall("user:1"))                   # {'name': 'alice', 'karma': '10'}
+r.hincrby("user:1", "karma", 5)
+
+# List: recent feed capped at 100
+r.lpush("recent:posts", 5, 6, 7)
+r.ltrim("recent:posts", 0, 99)
+print(r.lrange("recent:posts", 0, -1))       # ['7', '6', '5']
+
+# Set
+r.sadd("post:1:likers", "alice", "bob")
+print(r.sismember("post:1:likers", "bob"))   # True
+print(r.scard("post:1:likers"))              # 2
+
+# Sorted set
+r.zadd("trending", {"post:1": 10, "post:2": 25})
+r.zincrby("trending", 1, "post:1")
+print(r.zrevrange("trending", 0, 2, withscores=True))
+# [('post:2', 25.0), ('post:1', 11.0)]
+```
+
+Connection details:
+
+- `redis.Redis(...)` manages a **connection pool** internally, so create **one client** and reuse it. Don't make a new one per request.
+- Everything you store becomes a string or bytes. Numbers come back as strings, so use `int(r.get(...))`. For dicts, use `json.dumps` and `json.loads`, or a hash.
+- Connection URL form: `redis.Redis.from_url("redis://localhost:6379/0")`.
+- Use `r.ping()` to test the connection. If Redis isn't running you'll get `redis.exceptions.ConnectionError`.
+
+## Part 11: Tie it to your blog (45 min)
+
+Pick up the Django project from Day 12. Make a small `posts/redis_client.py`:
+
+```python
+import redis
+from django.conf import settings
+
+r = redis.Redis.from_url(
+    getattr(settings, "REDIS_URL", "redis://localhost:6379/0"),
+    decode_responses=True,
+)
+```
+
+Then try three tiny exercises, in a Django shell or a script:
+
+**1. A view counter.** On each post detail view, `r.incr(f"post:{post.pk}:views")`. Note that this is the atomic-counter benefit: no database write per page view.
+
+**2. A trending sorted set.** `r.zincrby("trending", 1, post.slug)` on a view, then `r.zrevrange("trending", 0, 4)` to get the top 5 slugs. Look those posts up in the database with one `filter(slug__in=...)` query. Remember the DB returns them in its own order, so re-sort to match the Redis ranking.
+
+**3. Simple rate limit** (a taste of Day 10's throttling gap):
+
+```python
+def allow_login(ip, limit=5, window=60):
+    key = f"ratelimit:login:{ip}"
+    count = r.incr(key)
+    if count == 1:
+        r.expire(key, window)
+    return count <= limit
+```
+
+This has a small race: if the process dies between `incr` and `expire`, the key never expires. You'll fix that with a pipeline or Lua later. Note that you spotted the bug by thinking about failure modes, which is the right habit.
+
+Don't wire these into production code yet; tomorrow is Redis as a Django cache, where this gets proper treatment.
+
+## Experiments (20 min)
+
+1. In `redis-cli`, `SET temp 1 EX 10`, then `TTL temp` repeatedly, then `GET temp` after it expires.
+2. `SET k v EX 100`, then `SET k v2`, then `TTL k`. Confirm the TTL was erased.
+3. Run `MONITOR` in one terminal and your Python snippets in another. Read the raw commands.
+4. `DEBUG SLEEP`-style demo: in one `redis-cli` run `EVAL "local t=redis.call('TIME'); while (redis.call('TIME')[1] - t[1] < 5) do end" 0` (blocks 5 seconds) and try `PING` from another terminal. Feel the single thread.
+5. Store the same 1,000-field object as 1,000 separate string keys vs one hash, then compare `INFO memory` and `DBSIZE`.
+6. `TYPE` a key, then try the wrong command on it (`LPUSH greeting x` on a string). Read the `WRONGTYPE` error.
+
+## Stretch goals
+
+- Run `redis-cli --latency` and `redis-cli --bigkeys`.
+- Use `SCAN` instead of `KEYS` to list keys, and write the loop in Python with `r.scan_iter(match="user:*")`.
+- Look at persistence: `CONFIG GET save`, then `BGSAVE`, and find `dump.rdb`.
+- Try a **pipeline** to send 1,000 `INCR`s in one round trip: `pipe = r.pipeline(); [pipe.incr("n") for _ in range(1000)]; pipe.execute()`. Time it against 1,000 separate calls.
+- Read about `SETNX`/`SET NX EX` as a simple distributed lock.
+
+## Day 14 checklist
+
+- [ ] Redis installed, `redis-cli ping` returns `PONG`
+- [ ] Used all five types: string, hash, list, set, sorted set
+- [ ] `SET ... EX`, `EXPIRE`, `TTL`, `DEL` practised, and `TTL` values `-1` and `-2` understood
+- [ ] Can explain why Redis is fast, and why one slow command hurts everyone
+- [ ] Can explain why `INCR` is safe under concurrency
+- [ ] `pip install redis` and connected with `decode_responses=True`
+- [ ] Ran `MONITOR` while executing Python commands
+- [ ] Tried the view counter, trending, and rate-limit exercises
+- [ ] Can name which data type fits: counter, queue, unique likers, leaderboard
+
+## Common gotchas
+
+- **`ConnectionRefusedError` / `redis.exceptions.ConnectionError`**: the server isn't running, or the port or host is wrong (Docker needs `-p 6379:6379`).
+- **Values come back as `b'...'`**: add `decode_responses=True`.
+- **`WRONGTYPE Operation against a key holding the wrong kind of value`**: you used a list command on a string key, or similar. Check with `TYPE`.
+- **`SET` wiping the TTL**: re-specify `EX` whenever you overwrite a key.
+- **`KEYS *` in production**: blocks the server. Use `SCAN`.
+- **Treating Redis as the source of truth**: by default it can lose recent writes on a crash. Keep authoritative data in the database.
+- **Exposing Redis to the internet**: it has no auth by default, and open Redis instances get hacked within hours. Bind to localhost, set `requirepass` or ACLs, and never publish port 6379 publicly.
+- **Creating a new client per request**: wasteful. Make one module-level client with its pool.
+- **Numbers being strings**: `r.get("n")` returns `"11"`. Convert explicitly.
+- **Hash values aren't nested**: you can't put a dict inside a hash field without serializing it.
+- **Forgetting that `FLUSHALL` wipes every database**: use `FLUSHDB` and double-check which DB you're on.
+- **Huge values or giant collections under one key**: they block the single thread when read or deleted. Use `UNLINK` and `SSCAN`/`HSCAN`.
+- **Unbounded growth**: lists and sets without `LTRIM` or TTLs eat RAM silently. Decide a cap or expiry when you design the key.
+
+Day 15 is typically Redis as a Django cache backend (`django-redis`, per-view caching, cache invalidation with your signals from Day 12), or Celery with Redis as the broker to fix the slow email receiver. Want that outline next?
