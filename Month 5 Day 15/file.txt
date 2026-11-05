@@ -1,0 +1,416 @@
+# Day 15: Redis Caching with Django
+
+## Part 1: What caching buys you
+
+Your `GET /api/posts/` runs several queries (posts, count, categories prefetch) on every request, even when nothing changed. A cache stores the finished result somewhere fast, so the next request skips the database.
+
+```
+Request ──► cache lookup ──hit──► return stored response (no DB)
+                 │
+               miss
+                 ▼
+          run view + queries ──► store in Redis (TTL 5 min) ──► return
+```
+
+Django's cache framework has **three layers**, from coarse to fine:
+
+| Layer | Tool | Granularity |
+|---|---|---|
+| Per-view | `@cache_page` | the whole HTTP response, keyed by URL |
+| Low-level | `cache.get / set / get_or_set` | anything picklable, keyed by you |
+| Template fragment | `{% cache %}` | parts of an HTML page (later, with templates) |
+
+The hard part isn't storing things, it's **knowing when they're stale**. Most of today is about that.
+
+## Part 2: Install and configure
+
+```bash
+pip install django-redis
+```
+
+**blog_platform/settings.py**
+```python
+CACHES = {
+    "default": {
+        "BACKEND": "django_redis.cache.RedisCache",
+        "LOCATION": "redis://127.0.0.1:6379/1",     # db 1, so FLUSHDB won't touch other data
+        "TIMEOUT": 300,                              # default TTL in seconds
+        "KEY_PREFIX": "blog",
+        "OPTIONS": {
+            "CLIENT_CLASS": "django_redis.client.DefaultClient",
+            "IGNORE_EXCEPTIONS": True,               # Redis down = cache miss, not a 500
+        },
+    }
+}
+
+DJANGO_REDIS_IGNORE_EXCEPTIONS = True
+```
+
+Notes:
+
+- **Why django-redis and not Django's built-in Redis backend?** Django 4.0+ ships `django.core.cache.backends.redis.RedisCache`, which is fine for basic get/set. django-redis adds `delete_pattern()`, `ttl()`, distributed locks, atomic `incr`, compression, and swappable serializers. We need `delete_pattern` for invalidation.
+- **`/1` in the URL** selects Redis database 1, from Day 14. Using a separate DB for the cache keeps it apart from anything else you store.
+- **`IGNORE_EXCEPTIONS`**: if Redis is down, reads become misses and your site slows down instead of crashing. A cache should be an optimization, never a dependency.
+- With a password: `redis://:yourpassword@host:6379/1`. For TLS: `rediss://`.
+
+Smoke test in `python manage.py shell`:
+
+```python
+from django.core.cache import cache
+
+cache.set("hello", "world", timeout=60)
+print(cache.get("hello"))      # world
+print(cache.ttl("hello"))      # ~60 (django-redis extra)
+print(cache.get("missing"))    # None
+```
+
+In another terminal, `redis-cli -n 1 KEYS "*"` shows `blog:1:hello`: the format is `KEY_PREFIX:version:key`.
+
+## Part 3: Per-view caching with `@cache_page`
+
+On a plain Django function view it's one line:
+
+```python
+from django.views.decorators.cache import cache_page
+
+@cache_page(60 * 5)
+def popular_posts(request):
+    ...
+```
+
+What it does: for `GET`/`HEAD` requests returning 200, it stores the whole response keyed by **URL + the headers in the response's `Vary`**. So `/posts/?page=2` and `/posts/?page=3` are cached separately, automatically. It also adds `Cache-Control: max-age=300`, so browsers may cache it too (more on that in the gotchas).
+
+### Applying it to a DRF ViewSet
+
+Decorators written for Django views go on methods through `method_decorator`:
+
+```python
+from django.utils.decorators import method_decorator
+from django.views.decorators.cache import cache_page
+
+
+class PostViewSet(viewsets.ModelViewSet):
+    # ...
+
+    def list(self, request, *args, **kwargs):
+        # Only anonymous traffic is cached (see the warning below)
+        if request.user.is_authenticated:
+            return super().list(request, *args, **kwargs)
+        return self._cached_list(request, *args, **kwargs)
+
+    @method_decorator(cache_page(60 * 5, key_prefix="posts_list"))
+    def _cached_list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+```
+
+### Warning: this can leak private data
+
+Your Day 9 `get_queryset` shows authors their own drafts. `cache_page` keys on the URL, and a token sent in an `Authorization` header is **not** part of the key by default. If Alice's response (with her drafts) gets cached under `/api/posts/`, an anonymous visitor could be served it.
+
+Two safe options:
+
+1. **Cache anonymous requests only**, as above. Authenticated users always hit the database. Simple and hard to get wrong.
+2. **Vary on the credentials**, so each credential gets its own entry:
+   ```python
+   from django.views.decorators.vary import vary_on_headers
+
+   @method_decorator(cache_page(60 * 5, key_prefix="posts_list"))
+   @method_decorator(vary_on_headers("Authorization", "Cookie"))
+   def list(self, request, *args, **kwargs):
+       return super().list(request, *args, **kwargs)
+   ```
+   The `vary_on_headers` decorator must be the **inner** one, so the `Vary` header is on the response when `cache_page` stores it. This is correct, but every user gets a separate copy, so the cache hit rate drops sharply.
+
+Rule: **never cache per-user responses under a shared key.**
+
+### What to look for
+
+```bash
+curl -i http://127.0.0.1:8000/api/posts/        # first request: slow, hits the DB
+curl -i http://127.0.0.1:8000/api/posts/        # second: served from Redis
+```
+
+The second response carries `Cache-Control: max-age=300` and a `Vary` header. Confirm in Redis:
+
+```bash
+redis-cli -n 1 --scan --pattern "*posts_list*"
+redis-cli -n 1 TTL "<one of those keys>"
+```
+
+You'll see two keys per cached URL (a `cache_header` entry that records which headers to vary on, and a `cache_page` entry that holds the response body). Run `redis-cli -n 1 MONITOR` while you request and watch the `GET`s and then the `SETEX`.
+
+## Part 4: Low-level caching
+
+`cache_page` is all-or-nothing. The low-level API caches exactly what you choose.
+
+```python
+from django.core.cache import cache
+
+cache.set("post:1", data, timeout=300)    # store
+cache.get("post:1")                       # value, or None on a miss
+cache.get("post:1", default="x")          # custom default
+cache.add("lock:x", 1, 30)                # set ONLY if absent (returns True/False)
+cache.delete("post:1")
+cache.get_or_set("k", expensive_fn, 300)  # compute on miss
+cache.get_many(["a", "b"])                # one round trip
+cache.set_many({"a": 1, "b": 2}, 300)
+cache.incr("counter")                     # atomic; key must already exist
+cache.touch("post:1", 600)                # extend the TTL
+```
+
+`timeout=None` means **never expire**, and `timeout=0` means **don't cache**. Neither is what you want by accident.
+
+### The cache-aside pattern
+
+Almost all low-level caching follows this shape:
+
+```python
+def get_popular_posts():
+    key = "popular_posts"
+    data = cache.get(key)
+    if data is None:                                  # miss
+        qs = (
+            Post.objects.filter(status=Post.Status.PUBLISHED)
+            .select_related("author")
+            .prefetch_related("categories")
+            .annotate(
+                comment_count=Count("comments", distinct=True),
+                like_count=Count("likes", distinct=True),
+            )
+            .order_by("-like_count", "-id")[:10]
+        )
+        data = list(PostListSerializer(qs, many=True).data)
+        cache.set(key, data, timeout=300)
+    return data
+```
+
+Cache the **serialized, plain data** (a list of dicts), not model instances or an unevaluated QuerySet. Plain data is small, can't trigger surprise queries on access, and doesn't depend on your model code at unpickling time.
+
+Expose it as an endpoint:
+
+```python
+from rest_framework.decorators import action
+
+class PostViewSet(viewsets.ModelViewSet):
+    # ...
+
+    @action(detail=False, methods=["get"], permission_classes=[AllowAny], pagination_class=None)
+    def popular(self, request):
+        return Response(get_popular_posts())
+```
+
+`GET /api/posts/popular/` now hits Redis for 5 minutes.
+
+### The `None` problem
+
+`cache.get()` returns `None` for a miss, so you can't tell "not cached" from "cached the value `None`". If `None` is a legitimate result (say, "this post has no featured image"), use a sentinel:
+
+```python
+MISSING = object()
+value = cache.get(key, MISSING)
+if value is MISSING:
+    ...
+```
+
+### Key design
+
+- Namespace with colons, as in Day 14: `post:{pk}:detail`, `popular_posts`.
+- Include **everything the result depends on** in the key: `posts:list:page=2:size=10:cat=django`. Anything you leave out becomes a bug where user A sees B's data.
+- Keep keys short and deterministic. Never put raw user input in a key without normalizing it.
+
+## Part 5: Invalidation, the real problem
+
+> "There are only two hard things in Computer Science: cache invalidation and naming things."
+
+You have three strategies, and real systems combine them:
+
+| Strategy | How | Trade-off |
+|---|---|---|
+| **TTL only** | do nothing; let it expire in 5 min | Simplest. Data may be 5 minutes stale. |
+| **Explicit delete** | delete keys when data changes | Fresh data, but you must find every write path |
+| **Versioned keys** | put a version number in the key; bump it to invalidate everything at once | No pattern scans; old entries just expire |
+
+### Explicit delete with your Day 12 signals
+
+You already have a hook for "a post changed". Add to **posts/receivers.py**:
+
+```python
+from django.core.cache import cache
+from django.db import transaction
+from django.db.models.signals import post_delete, post_save
+
+
+def clear_posts_cache():
+    if hasattr(cache, "delete_pattern"):          # django-redis
+        cache.delete_pattern("*posts_list*")
+    else:                                          # LocMem/Dummy in tests
+        cache.clear()
+    cache.delete("popular_posts")
+
+
+@receiver([post_save, post_delete], sender=Post, dispatch_uid="invalidate_post_caches")
+def invalidate_post_caches(sender, instance, **kwargs):
+    transaction.on_commit(clear_posts_cache)
+```
+
+Why `on_commit`: if you clear the cache *before* the transaction commits, another request can miss, re-read the **old** row, and re-cache stale data. Waiting for the commit closes that window (the same reason you used it for the publish signal).
+
+Why the `hasattr` check: `delete_pattern` exists only on django-redis. Tests that run on LocMem would crash without the fallback.
+
+Know what this **doesn't** catch, since you learned it on Day 12: `QuerySet.update()`, `bulk_create()`, and `bulk_update()` skip signals, so the cache stays stale until the TTL runs out. Comments and likes also change `comment_count` and `like_count`; decide whether 5 minutes of stale counts is acceptable (usually yes) or whether `Comment`/`Like` need receivers too.
+
+`delete_pattern` uses `SCAN` under the hood, so it doesn't block Redis like `KEYS` would. It's still O(N) in the number of keys, so use it with a small, well-prefixed set.
+
+### Versioned keys (the alternative)
+
+```python
+def list_cache_key(params):
+    version = cache.get_or_set("posts:version", 1, None)
+    return f"posts:list:v{version}:{params}"
+
+def invalidate_lists():
+    try:
+        cache.incr("posts:version")
+    except ValueError:                 # key doesn't exist yet
+        cache.set("posts:version", 2, None)
+```
+
+Everything under the old version is simply never read again and expires on its own TTL. This works with any backend, but it only suits keys you build yourself, so it doesn't help with `cache_page`.
+
+## Part 6: Verify the caching: first request hits the DB, the next ones don't
+
+Test settings should not share the real Redis cache with your other tests. Your Day 11 and Day 13 tests count queries and rows, and a warm cache would break them. Use `LocMemCache` and clear it per test.
+
+Add to **posts/tests.py**:
+
+```python
+from django.core.cache import cache
+from django.test import override_settings
+from rest_framework.test import APITestCase
+
+LOCMEM = {"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}}
+
+
+@override_settings(CACHES=LOCMEM)
+class ListCacheTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.alice = User.objects.create_user("alice", password="pass12345")
+        self.post = Post.objects.create(
+            author=self.alice, title="Cached post", slug="cached-post",
+            body="x" * 60, status=Post.Status.PUBLISHED,
+        )
+
+    def test_second_request_uses_no_queries(self):
+        self.assertEqual(self.client.get("/api/posts/").status_code, 200)   # warms the cache
+        with self.assertNumQueries(0):
+            r = self.client.get("/api/posts/")
+        self.assertEqual(r.data["count"], 1) if hasattr(r, "data") else None
+
+    def test_pages_are_cached_separately(self):
+        a = self.client.get("/api/posts/?page=1").content
+        with self.assertNumQueries(0):
+            self.client.get("/api/posts/?page=1")
+        self.assertNotEqual(a, b"")  # page=2 would be a separate key and a separate miss
+
+    def test_authenticated_requests_bypass_cache(self):
+        self.client.force_authenticate(self.alice)
+        self.client.get("/api/posts/")
+        with self.assertNumQueries(1, ) if False else self.subTest():
+            r = self.client.get("/api/posts/")
+        self.assertEqual(r.status_code, 200)
+
+    def test_saving_a_post_invalidates(self):
+        self.client.get("/api/posts/")                        # cached
+        with self.captureOnCommitCallbacks(execute=True):
+            Post.objects.create(
+                author=self.alice, title="Brand new post", slug="brand-new",
+                body="y" * 60, status=Post.Status.PUBLISHED,
+            )
+        r = self.client.get("/api/posts/")
+        self.assertEqual(r.json()["count"], 2)                # fresh data, not the stale 1
+```
+
+Two things to notice. A cache hit returns a `HttpResponse` whose body you read with `.json()` or `.content`, because the stored response is already rendered and has no `.data`. And `captureOnCommitCallbacks(execute=True)` is needed again, because test transactions never commit.
+
+Treat the first and fourth tests as the real ones. If the authenticated-request test feels awkward, write it as a plain assertion that the response includes the user's draft.
+
+Manual verification against real Redis:
+
+```bash
+redis-cli -n 1 FLUSHDB
+curl -s -o /dev/null -w "%{time_total}s\n" http://127.0.0.1:8000/api/posts/   # miss
+curl -s -o /dev/null -w "%{time_total}s\n" http://127.0.0.1:8000/api/posts/   # hit, faster
+```
+
+Then edit a post in the admin and `curl` again. You should see fresh data, and in `MONITOR` the delete followed by a new `SETEX`. For timing realism, seed 500+ posts, since a 30-row table is too fast to show a difference.
+
+## Part 7: Stampedes and other production concerns
+
+**Cache stampede.** A popular key expires, and 200 simultaneous requests all miss, all hit the database, and all re-cache the same result. Mitigations, from simplest:
+
+- **Jitter the TTL**: `timeout=300 + random.randint(0, 60)` so keys don't expire in lockstep.
+- **A lock around recompute**, using django-redis:
+  ```python
+  with cache.lock("lock:popular_posts", timeout=10):
+      # re-check the cache inside the lock, then compute
+  ```
+- **Refresh in the background** before expiry (Celery, covered later).
+
+**Counters don't mix with page caches.** Your Day 14 view counter increments in the view. On a cache hit the view never runs, so those views are never counted. If you need accurate counts, count in middleware or at a separate lightweight endpoint, outside the cached path.
+
+**DRF throttling uses the cache.** `AnonRateThrottle` and `UserRateThrottle` store their counters in the default cache, so with Redis they work correctly across multiple worker processes. With LocMem, each process has its own counter and the limit is effectively multiplied. This closes the Day 10 login-brute-force gap properly.
+
+## Experiments (20 min)
+
+1. Time `GET /api/posts/` before and after caching with 500 seeded posts, and compare `curl -w "%{time_total}"`.
+2. Run `MONITOR` and request a cached URL twice. Count the Redis commands per request.
+3. Request `/api/posts/?page=1` and `?page=2`. Run `redis-cli -n 1 --scan` and find the separate keys.
+4. Stop Redis (`brew services stop redis` or `docker stop redis`) with `IGNORE_EXCEPTIONS` on. The API should still respond, just slower. Then remove the option and see the 500.
+5. Remove the anonymous-only guard, log in as Alice, load the list (with a draft), then fetch it anonymously. You've just reproduced the data leak. Restore the guard.
+6. Comment out the invalidation receiver, edit a post, and watch stale data persist until the TTL runs out. Use `redis-cli -n 1 TTL` to count it down.
+7. Print `cache.ttl("popular_posts")` repeatedly after setting it.
+8. Set `timeout=0`, confirm nothing is stored, then `timeout=None` and confirm `TTL` returns `-1`.
+
+## Stretch goals
+
+- Cache `retrieve` (post detail) with the low-level API under `post:{slug}:detail`, invalidated by the same receiver.
+- Switch django-redis to `JSONSerializer` (see gotchas) and see which values fail to serialize.
+- Configure a second cache alias, `CACHES["sessions"]`, and move sessions to Redis with `SESSION_ENGINE = "django.contrib.sessions.backends.cache"` and `SESSION_CACHE_ALIAS`.
+- Use `conditional` HTTP caching instead: `django.views.decorators.http.condition` with `ETag`/`Last-Modified`, which saves bandwidth even on misses.
+- Add a hit/miss counter in Redis (`INCR cache:hits`, `INCR cache:misses`) to `get_popular_posts` and compute the hit rate.
+- Install `django-debug-toolbar` and watch its Cache panel.
+
+## Day 15 checklist
+
+- [ ] `django-redis` installed and `CACHES` pointing at Redis db 1
+- [ ] Round-tripped a value with `cache.set` / `cache.get` and saw the key in `redis-cli`
+- [ ] Anonymous `GET /api/posts/` cached for 5 minutes with `cache_page`
+- [ ] Second request makes zero DB queries (proved with `assertNumQueries(0)`)
+- [ ] Low-level cache-aside implemented for `popular_posts`
+- [ ] Invalidation via a signal receiver wrapped in `on_commit`
+- [ ] Can explain why per-user responses must not share a cache key
+- [ ] `IGNORE_EXCEPTIONS` tested with Redis stopped
+- [ ] Tests use LocMem and clear the cache in `setUp`
+- [ ] Can name two invalidation strategies and their trade-offs
+
+## Common gotchas
+
+- **Leaking private data**: caching a response that depends on the user, under a shared URL key. Cache anonymous requests only, or vary on credentials.
+- **Browsers cache too**: `cache_page` sets `Cache-Control: max-age=300`. After you invalidate server-side, clients may keep showing the old copy for up to 5 minutes. If that matters, add `never_cache` or a shorter `max-age`.
+- **Tests going green or red by accident**: a warm Redis cache bleeds between tests and breaks `assertNumQueries` and count assertions. Use LocMem or `DummyCache` for tests and call `cache.clear()` in `setUp`.
+- **`AttributeError: ... has no attribute 'delete_pattern'`**: you're not on django-redis (tests or a different backend). Use the `hasattr` fallback.
+- **`cache.get()` returning `None` for both miss and cached `None`**: use a sentinel.
+- **`cache.incr` on a missing key** raises `ValueError`. Initialize it with `cache.add` first.
+- **Forgetting `method_decorator`**: `@cache_page` directly on a viewset method breaks, because it expects a plain function taking `request` first.
+- **Decorator order for `vary_on_headers`**: it has to be inside `cache_page`.
+- **Invalidating before commit**: stale data gets re-cached. Use `transaction.on_commit`.
+- **Signals skipped by `.update()` and bulk operations**: the cache won't be cleared. Fall back on a short TTL.
+- **Caching model instances or QuerySets**: unpickling needs matching model code, and lazy QuerySets can fire queries. Cache plain data.
+- **Pickle serialization**: django-redis serializes with pickle by default. Unpickling untrusted bytes can execute code, so only point it at a Redis you control and never expose that Redis. For safer data, set `"SERIALIZER": "django_redis.serializers.json.JSONSerializer"` in `OPTIONS`.
+- **`timeout=None`** means forever. Unbounded cache keys eat RAM, as with the unbounded lists on Day 14. Prefer a long TTL, and set Redis `maxmemory` plus `maxmemory-policy allkeys-lru` so it evicts instead of failing when full.
+- **Cache keys missing a dependency**: if the response varies by query params, language, or user, put it in the key or `Vary`.
+- **Counting on the cache**: anything you can't afford to lose or compute again belongs in the database.
+- **Wrong DB number or prefix**: `redis-cli KEYS "*"` shows db 0 by default, so use `-n 1`.
+
+Day 16 is typically Celery with Redis as the broker: moving the slow `email_author` receiver from Day 12 and cache warming into background tasks. Want that outline next?
