@@ -1,0 +1,420 @@
+# Day 16: Cache Invalidation
+
+## Part 0: Two fixes to Day 15's tests
+
+Two of my Day 15 tests were sloppy. One had a leftover `if hasattr(...) else None` and the other had a nonsense `assertNumQueries ... if False` line. Replace them with these:
+
+```python
+def test_second_request_uses_no_queries(self):
+    self.client.get("/api/posts/")                     # warms the cache
+    with self.assertNumQueries(0):
+        r = self.client.get("/api/posts/")
+    self.assertEqual(r.json()["count"], 1)
+
+def test_authenticated_requests_bypass_cache(self):
+    self.client.get("/api/posts/")                     # anonymous copy now cached
+    Post.objects.create(
+        author=self.alice, title="Alice draft", slug="alice-draft",
+        body="x" * 60, status=Post.Status.DRAFT,
+    )
+    self.client.force_authenticate(self.alice)
+    r = self.client.get("/api/posts/")
+    self.assertEqual(r.json()["count"], 2)             # sees her draft, not the cached anon copy
+```
+
+The second test works because the draft's invalidation callback never runs (no `captureOnCommitCallbacks`). That leaves the stale anonymous entry in place, so only the authenticated bypass can produce count 2. Drop `test_pages_are_cached_separately`, as it asserted nothing useful.
+
+## Part 1: Why invalidation is hard
+
+Day 15 stored results. Today is about when they stop being true. Four failure modes matter:
+
+| Problem | What happens |
+|---|---|
+| **Stale data** | A post is edited, but the cache serves the old version until the TTL runs out |
+| **Missed write path** | `.update()`, `bulk_create()`, raw SQL, or another service changes the DB without clearing the cache (Day 12's signal blind spots) |
+| **Stale-set race** | Request A misses and reads the old row. B updates the row and deletes the key. A then writes its old data into the cache, and the stale value now lives for a full TTL |
+| **Stampede** | A hot key is deleted or expires, 200 requests miss together and all hit the DB |
+
+The stale-set race is subtle:
+
+```
+A: cache miss ─► reads DB (old) ─────────────────────► cache.set(old)  ✗ stale
+B:                      UPDATE row ─► commit ─► cache.delete
+```
+
+You can't fully eliminate it with plain delete-on-write. You reduce it by deleting after commit, keeping TTLs short, and accepting small windows. For most blogs that is the correct engineering answer. Zero staleness would need versioned writes or leases, which is complexity you'd only pay for with real requirements.
+
+The TTL is your safety net. Treat explicit invalidation as an optimization for freshness. A bug in your invalidation then costs minutes of staleness, not forever.
+
+## Part 2: Map dependencies first
+
+Before writing receivers, write down what depends on what, and how stale each thing may be:
+
+| Cached thing | Changes when | Tolerable staleness | Strategy |
+|---|---|---|---|
+| Post detail (`post:{slug}:detail`) | Post edited or deleted, comment added, categories changed | seconds | explicit delete |
+| Post lists (`posts_list*`, cache_page) | Post created, edited, published, or deleted | seconds to a minute | pattern delete |
+| Popular posts | Likes change a lot, posts change | minutes | **TTL only** |
+| `comment_count` / `like_count` inside lists | Every comment or like | minutes | **TTL only** |
+
+The last two rows are deliberate choices. If every like deleted every cached list, a busy site would have a hit rate near zero and the cache would be pointless. **Invalidate where freshness is worth the lost hits, and let the TTL handle the rest.**
+
+## Part 3: Explicit, namespaced keys in one place
+
+Scattered f-strings like `f"post:{slug}:detail"` in three files will drift apart, and one typo means a silent never-invalidated key. Centralize:
+
+**posts/cache_utils.py**
+```python
+import random
+from contextlib import nullcontext
+
+from django.core.cache import cache
+
+MISSING = object()
+
+POPULAR_KEY = "popular_posts"
+LIST_PREFIX = "posts_list"           # matches key_prefix in Day 15's cache_page
+
+
+def post_detail_key(slug: str) -> str:
+    return f"post:{slug}:detail"
+
+
+def jittered(ttl: int = 300, spread: int = 60) -> int:
+    """TTL plus random jitter, so keys created together don't expire together."""
+    return ttl + random.randint(0, spread)
+
+
+def delete_lists() -> None:
+    if hasattr(cache, "delete_pattern"):          # django-redis
+        cache.delete_pattern(f"*{LIST_PREFIX}*")
+    else:                                          # LocMem in tests
+        cache.clear()
+
+
+def cache_lock(name: str, timeout: int = 10, blocking_timeout: int = 5):
+    """A Redis lock when available, a no-op otherwise (LocMem has no locks)."""
+    if hasattr(cache, "lock"):
+        return cache.lock(name, timeout=timeout, blocking_timeout=blocking_timeout)
+    return nullcontext()
+```
+
+Rules for keys:
+
+- **One module owns the format.** Everyone calls `post_detail_key(slug)`.
+- **Namespace with colons**: `post:{id}:detail`, as in Day 14.
+- **Include everything the value depends on** (page, filters, language). Anything you leave out can show user A user B's data.
+- **Prefer immutable identifiers.** A slug can be edited, which orphans the old key. We handle that in the gotchas.
+
+## Part 4: Cache the detail view
+
+Add to `PostViewSet`, anonymous only for the same leak reason as Day 15:
+
+```python
+from django.core.cache import cache
+from .cache_utils import MISSING, jittered, post_detail_key
+
+class PostViewSet(viewsets.ModelViewSet):
+    # ...
+
+    def retrieve(self, request, *args, **kwargs):
+        if request.user.is_authenticated:
+            return super().retrieve(request, *args, **kwargs)
+
+        key = post_detail_key(kwargs[self.lookup_field])
+        data = cache.get(key, MISSING)
+        if data is MISSING:
+            response = super().retrieve(request, *args, **kwargs)
+            if response.status_code == 200:
+                cache.set(key, dict(response.data), jittered())
+            return response
+        return Response(data)
+```
+
+Only 200s are stored, so a 404 for a not-yet-existing slug is never cached. Caching misses ("negative caching") is a legitimate technique, but then creating that post must clear the key.
+
+## Part 5: Signals do the invalidating
+
+This replaces Day 15's single receiver. In **posts/receivers.py**:
+
+```python
+from django.core.cache import cache
+from django.db import transaction
+from django.db.models.signals import m2m_changed, post_delete, post_save
+from django.dispatch import receiver
+
+from .cache_utils import POPULAR_KEY, delete_lists, post_detail_key
+from .models import Comment, Like, Post
+
+
+@receiver([post_save, post_delete], sender=Post, dispatch_uid="cache_invalidate_post")
+def invalidate_on_post_change(sender, instance, **kwargs):
+    slug = instance.slug                     # capture now; the row may be gone later
+
+    def run():
+        cache.delete_many([post_detail_key(slug), POPULAR_KEY])
+        delete_lists()
+
+    transaction.on_commit(run)
+
+
+def invalidate_on_child_change(sender, instance, **kwargs):
+    """Comments and likes: refresh the one detail page, leave lists to the TTL."""
+    post_id = instance.post_id
+
+    def run():
+        slug = Post.objects.filter(pk=post_id).values_list("slug", flat=True).first()
+        if slug:                             # None if the post itself was just deleted
+            cache.delete(post_detail_key(slug))
+
+    transaction.on_commit(run)
+
+
+for _model in (Comment, Like):
+    receiver(
+        [post_save, post_delete],
+        sender=_model,
+        dispatch_uid=f"cache_invalidate_{_model.__name__.lower()}",
+    )(invalidate_on_child_change)
+
+
+@receiver(m2m_changed, sender=Post.categories.through, dispatch_uid="cache_invalidate_categories")
+def invalidate_on_category_change(sender, instance, action, reverse, **kwargs):
+    if reverse or action not in ("post_add", "post_remove", "post_clear"):
+        return
+    slug = instance.slug
+
+    def run():
+        cache.delete(post_detail_key(slug))
+        delete_lists()
+
+    transaction.on_commit(run)
+```
+
+Why it's written this way:
+
+- **Everything goes through `on_commit`** so nobody can re-cache the old row between your delete and the commit. It's the same reasoning as Days 12 and 15.
+- **The slug is captured eagerly.** By the time the callback runs after a delete, `instance` is stale.
+- **The child receiver uses `post_id` and a fresh query.** During a cascading delete, `comment.post` may already be gone and accessing it can raise. `post_id` is always there, and a `None` slug means the post's own receiver already handles it.
+- **`m2m_changed` is required.** `post.categories.add()` doesn't fire `post_save`, so without it, category changes would never invalidate.
+- **The `reverse` check** skips the case where you call `category.posts.add(post)`. There `instance` is a `Category`, not a `Post`. Handle it if you use that direction, via `pk_set`.
+- **Comments and likes only clear the detail page.** That's the trade-off from Part 2, made explicit in code.
+
+Your Day 12 admin action loops over `save()`, so publishing 50 posts runs `delete_lists()` 50 times, each a `SCAN`. It works, but for large bulk edits do one invalidation after the loop instead.
+
+## Part 6: Fix the stampede
+
+Rewrite Day 15's `get_popular_posts()` with a lock, a double-check, and jittered TTL:
+
+```python
+import redis
+from django.db.models import Count
+
+from .cache_utils import MISSING, POPULAR_KEY, cache_lock, jittered
+
+
+def _build_popular():
+    qs = (
+        Post.objects.filter(status=Post.Status.PUBLISHED)
+        .select_related("author")
+        .prefetch_related("categories")
+        .annotate(
+            comment_count=Count("comments", distinct=True),
+            like_count=Count("likes", distinct=True),
+        )
+        .order_by("-like_count", "-id")[:10]
+    )
+    return list(PostListSerializer(qs, many=True).data)
+
+
+def get_popular_posts():
+    data = cache.get(POPULAR_KEY, MISSING)
+    if data is not MISSING:
+        return data
+
+    try:
+        with cache_lock("lock:popular_posts"):
+            data = cache.get(POPULAR_KEY, MISSING)      # someone may have filled it while we waited
+            if data is MISSING:
+                data = _build_popular()
+                cache.set(POPULAR_KEY, data, jittered())
+            return data
+    except redis.exceptions.RedisError:
+        return _build_popular()                         # lock or Redis trouble: degrade, don't fail
+```
+
+What this gives you:
+
+1. **First check, outside the lock.** Hits (the overwhelming majority) never touch the lock.
+2. **One request rebuilds.** The others wait up to `blocking_timeout`, then find the value filled when they re-check inside the lock.
+3. **The lock has a `timeout`**, so a crashed worker can't hold it forever.
+4. **If the lock times out or Redis misbehaves**, the request computes directly instead of failing. `LockError` is a subclass of `RedisError`. `IGNORE_EXCEPTIONS` doesn't cover `cache.lock`, which is why we catch explicitly.
+5. **`cache_lock` falls back to a no-op in tests**, since LocMem has no `.lock()`.
+
+Other stampede options: jitter alone (cheap and often enough), refreshing before expiry in a background task (Celery, coming up), and serving slightly stale data while one request refreshes it.
+
+## Part 7: Tests
+
+Use LocMem and clear the cache in `setUp`, as on Day 15.
+
+```python
+from unittest import mock
+
+from django.core.cache import cache
+from django.test import override_settings
+from rest_framework.test import APITestCase
+
+from .cache_utils import post_detail_key
+from .models import Comment
+
+LOCMEM = {"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}}
+
+
+@override_settings(CACHES=LOCMEM)
+class InvalidationTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.alice = User.objects.create_user("alice", password="pass12345")
+        self.post = Post.objects.create(
+            author=self.alice, title="Original title", slug="orig",
+            body="x" * 60, status=Post.Status.PUBLISHED,
+        )
+
+    def test_detail_is_cached_then_invalidated_on_edit(self):
+        self.client.get("/api/posts/orig/")
+        self.assertIsNotNone(cache.get(post_detail_key("orig")))
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.post.title = "Edited title"
+            self.post.save()
+
+        self.assertIsNone(cache.get(post_detail_key("orig")))
+        self.assertEqual(self.client.get("/api/posts/orig/").json()["title"], "Edited title")
+
+    def test_delete_clears_detail(self):
+        self.client.get("/api/posts/orig/")
+        with self.captureOnCommitCallbacks(execute=True):
+            self.post.delete()
+        self.assertIsNone(cache.get(post_detail_key("orig")))
+        self.assertEqual(self.client.get("/api/posts/orig/").status_code, 404)
+
+    def test_comment_refreshes_detail_but_not_lists(self):
+        self.client.get("/api/posts/orig/")
+        self.client.get("/api/posts/")
+        with self.captureOnCommitCallbacks(execute=True):
+            Comment.objects.create(post=self.post, author=self.alice, body="hi")
+        self.assertIsNone(cache.get(post_detail_key("orig")))
+        # the list entry is deliberately left to the TTL: assert your chosen policy
+        with self.assertNumQueries(0):
+            self.client.get("/api/posts/")
+
+    def test_queryset_update_does_not_invalidate(self):
+        """The known blind spot, proven."""
+        self.client.get("/api/posts/orig/")
+        with self.captureOnCommitCallbacks(execute=True):
+            Post.objects.filter(pk=self.post.pk).update(title="Sneaky")
+        self.assertIsNotNone(cache.get(post_detail_key("orig")))   # still the old data
+
+    def test_popular_is_built_once(self):
+        from . import views
+        with mock.patch.object(views, "_build_popular", return_value=[]) as build:
+            views.get_popular_posts()
+            views.get_popular_posts()
+        self.assertEqual(build.call_count, 1)
+```
+
+The last test patches `_build_popular` where it's *used*. Patch the module that calls it (adjust `views` to wherever you put the function), not where it's defined. The last four tests document behavior, so when you change policy, change the test deliberately.
+
+## Part 8: Measure it
+
+Seed 500+ posts first, since a tiny table hides the difference:
+
+```bash
+redis-cli -n 1 FLUSHDB
+
+# one miss, then several hits
+for i in 1 2 3 4 5; do
+  curl -s -o /dev/null -w "request $i: %{time_total}s\n" http://127.0.0.1:8000/api/posts/
+done
+```
+
+Expect request 1 to be noticeably slower than 2 to 5. Exact numbers depend entirely on your machine, data size, and whether Django is in debug mode, so don't compare against anyone else's figures. Compare your own before and after.
+
+More useful measurements:
+
+```bash
+# timing breakdown: connect / first byte / total
+curl -s -o /dev/null -w "ttfb=%{time_starttransfer}s total=%{time_total}s\n" \
+  http://127.0.0.1:8000/api/posts/
+
+# prove invalidation: warm, edit in admin, request again
+curl -s http://127.0.0.1:8000/api/posts/ | head -c 300
+# ...edit a title in the admin...
+curl -s http://127.0.0.1:8000/api/posts/ | head -c 300       # should show the new title
+
+# quick load: 200 requests, 20 at a time (requires `apache2-utils` / `ab`)
+ab -n 200 -c 20 http://127.0.0.1:8000/api/posts/
+```
+
+Then check what's in Redis:
+
+```bash
+redis-cli -n 1 --scan --pattern "*"              # all cache keys
+redis-cli -n 1 TTL "blog:1:post:orig:detail"      # time left
+redis-cli -n 1 MONITOR                            # watch deletes after an edit
+```
+
+Track hit rate too. Add counters to `get_popular_posts` (`cache.incr` needs the key to exist, so use `cache.add("stats:hits", 0, None)` first), then compute `hits / (hits + misses)`. A cache that never hits isn't helping, and invalidation that's too aggressive is the usual reason.
+
+## Experiments (25 min)
+
+1. Edit a post in the admin and watch `MONITOR`. Find the `DEL`s and the `SCAN`.
+2. Comment out the `on_commit` wrapper (call `run()` directly), then try to catch a stale re-cache with two shell sessions and a sleep in between. Restore it.
+3. Run `Post.objects.update(title="x")` and read the stale detail page. Wait for the TTL to see it self-heal.
+4. Remove the jitter, warm 100 keys, and compare their TTLs with `redis-cli`. Then add jitter back and compare again.
+5. Simulate a stampede: `ab -n 500 -c 50` against `/api/posts/popular/` right after `FLUSHDB`, with a `time.sleep(1)` in `_build_popular` and a counter. Count builds with and without the lock.
+6. Rename a post's slug and watch the old detail key linger (see gotchas).
+7. Stop Redis and confirm the endpoints still respond.
+8. Let the TTL tick down while you load the list, and see how much slower the single miss is.
+
+## Stretch goals
+
+- Switch the lists to **versioned keys** (Day 15) and delete the `delete_pattern` call.
+- Add an `X-Cache: HIT/MISS` response header for easier measuring.
+- Add `Retry`-safe invalidation: if `cache.delete_many` raises inside `on_commit`, log it and fall back to a short TTL.
+- Write a management command `clear_blog_cache` for manual flushes of just your key prefix.
+- Add a `Cache-Control: no-cache` variant for the admin preview path.
+
+## Day 16 checklist
+
+- [ ] Can explain staleness, the stale-set race, and a stampede
+- [ ] Wrote a dependency map: what invalidates what, and acceptable staleness
+- [ ] All keys built by functions in `cache_utils.py`
+- [ ] Post detail cached for anonymous users only
+- [ ] Receivers for Post, Comment, Like, and `m2m_changed`, all via `on_commit`
+- [ ] Deliberately left list counts to the TTL, and can justify it
+- [ ] Popular posts protected by lock, double-check, and jittered TTL
+- [ ] Tests prove invalidation, and prove the `.update()` blind spot
+- [ ] Measured miss vs hit with `curl -w` on a realistic data size
+- [ ] Fixed the two Day 15 tests
+
+## Common gotchas
+
+- **Invalidating before commit**: another request re-caches old data. Always `on_commit`.
+- **Slug edits orphan keys**: the old `post:{old-slug}:detail` stays until its TTL. Make slugs immutable after creation, or capture the old slug in a `pre_save` receiver and delete both.
+- **Instance is stale in `post_delete`**: capture what you need (slug, pk) before the callback.
+- **Accessing `instance.post` in a cascade**: use `post_id` instead.
+- **`post.categories.add()` doesn't fire `post_save`**: you need `m2m_changed`.
+- **`.update()`, `bulk_create()`, `bulk_update()`, raw SQL** skip signals. Keep TTLs as the backstop, or call invalidation explicitly after bulk operations.
+- **Over-invalidating**: clearing lists on every like drives the hit rate toward zero. Decide per key.
+- **Under-invalidating**: forgetting a write path (a management command, an admin action, another service). The TTL bounds the damage.
+- **`delete_pattern` is O(N) in keys**: fine with a prefix and a modest key count, bad on a huge shared DB.
+- **Cache key missing a dependency**: results vary by query params, filters, or user, and the key doesn't say so.
+- **Caching per-user data under a shared key**: still the worst bug in this whole topic.
+- **Lock without a timeout**: a crashed holder blocks everyone. Always set `timeout`.
+- **`cache.lock` on LocMem**: doesn't exist. The `cache_lock` fallback exists for this.
+- **Mocking the wrong target**: patch the name where it is looked up, not where it's defined.
+- **Browser caching**: `cache_page` sets `max-age=300`, so clients may ignore your server-side invalidation for up to 5 minutes.
+- **Treating the cache as truth**: if losing a key breaks correctness, that data belongs in the database.
+
+Day 17 is typically a Redis-focused review (or a mini rate limiter built on `INCR` + `EXPIRE`), and Celery with Redis as the broker to move the slow `email_author` receiver and cache warming into background tasks follows after. Want that outline next?
