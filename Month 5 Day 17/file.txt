@@ -1,0 +1,374 @@
+# Day 17: Celery Setup
+
+## Part 1: What Celery is, and the problem it solves
+
+On Day 12 you saw the catch with signals: `email_author` runs **inside the request**. A slow SMTP server means a slow API response, and a failing one means an error or a lost email. Celery moves that work out of the request.
+
+```
+Django (producer)          Redis (broker)           Celery worker (consumer)
+─────────────────          ──────────────           ────────────────────────
+task.delay(42)  ───────►   list "celery"   ───────►  picks up message,
+returns instantly          [msg, msg, ...]            runs the task function
+```
+
+Three parts:
+
+| Part | Role | In this project |
+|---|---|---|
+| **Producer** | Your Django code calls `task.delay(...)`, which serializes the call into a message | `runserver` / gunicorn |
+| **Broker** | Holds messages until a worker takes them | Redis |
+| **Worker** | A separate process that pulls messages and executes the function | `celery -A blog_platform worker` |
+
+This is Day 14's "queue" pattern (`LPUSH` a job, `BRPOP` to take it) with retries, concurrency, and scheduling built on top. You can watch it happen in Redis below.
+
+**The key mental shift:** the worker is a **different process** from your web server. It imports your Django code separately, shares nothing in memory with it, and only sees what's in the message and the database.
+
+## Part 2: Install
+
+```bash
+pip install "celery[redis]"
+```
+
+The `[redis]` extra installs the Redis client dependencies. Make sure Redis is running (`redis-cli ping`).
+
+Use a **separate Redis database** for each job so nothing collides:
+
+| DB | Purpose |
+|---|---|
+| 0 | default / scratch |
+| 1 | Django cache (Day 15) |
+| 2 | Celery broker (today) |
+| 3 | Celery results (optional, below) |
+
+## Part 3: Wire Celery into Django
+
+Three small pieces.
+
+**1. blog_platform/celery.py** (new file, next to `settings.py`)
+```python
+import os
+
+from celery import Celery
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "blog_platform.settings")
+
+app = Celery("blog_platform")
+app.config_from_object("django.conf:settings", namespace="CELERY")
+app.autodiscover_tasks()
+```
+
+- `setdefault` makes sure Django settings are found when the worker starts, since the worker isn't launched by `manage.py`.
+- `namespace="CELERY"` means every Celery setting in `settings.py` must start with `CELERY_`.
+- `autodiscover_tasks()` looks for a `tasks.py` in every app in `INSTALLED_APPS`.
+
+**2. blog_platform/\_\_init__.py**
+```python
+from .celery import app as celery_app
+
+__all__ = ("celery_app",)
+```
+
+This loads the app when Django starts, so `@shared_task` binds to it.
+
+**3. blog_platform/settings.py**
+```python
+CELERY_BROKER_URL = "redis://127.0.0.1:6379/2"
+CELERY_RESULT_BACKEND = "redis://127.0.0.1:6379/3"   # optional: lets you read return values
+
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TIMEZONE = "UTC"
+CELERY_RESULT_EXPIRES = 3600           # results are deleted after an hour
+CELERY_TASK_TIME_LIMIT = 60            # hard-kill any task running over 60s
+CELERY_TASK_SOFT_TIME_LIMIT = 45       # raises SoftTimeLimitExceeded inside the task first
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+```
+
+Notes:
+
+- **JSON-only serialization** is the safe default. Pickle would let anyone who can write to your broker execute code in your workers (the same warning as django-redis on Day 15).
+- **JSON means arguments must be JSON-friendly**: ints, strings, lists, dicts. Not model instances, not `datetime`, not QuerySets (see the gotchas).
+- The **result backend is optional**. If you never read return values, skip it, since it just adds Redis writes. We enable it today so you can inspect results.
+- Time limits stop a stuck task from occupying a worker forever.
+
+## Part 4: Your first tasks
+
+Celery finds tasks in **posts/tasks.py**:
+
+```python
+from celery import shared_task
+from celery.utils.log import get_task_logger
+
+logger = get_task_logger(__name__)
+
+
+@shared_task
+def add(x, y):
+    logger.info("Adding %s + %s", x, y)
+    return x + y
+
+
+@shared_task
+def hello(name):
+    logger.info("Hello, %s! (from the worker)", name)
+    return f"Hello, {name}"
+```
+
+- **`@shared_task`** vs `@app.task`: `shared_task` doesn't import a specific Celery app, so reusable apps like `posts` stay decoupled from the project. This is the standard choice in Django.
+- **`get_task_logger`** gives you logs tagged with the task name and id, appearing in the **worker's** terminal.
+- A task is a plain function. Calling `add(2, 3)` still runs it synchronously in the current process, which is handy for testing.
+
+## Part 5: Run a worker
+
+Open a **second terminal** (keep `runserver` running in the first), activate the venv, and from the folder containing `manage.py`:
+
+```bash
+celery -A blog_platform worker --loglevel=INFO
+```
+
+On Windows, add `--pool=solo`, since the default prefork pool doesn't work there.
+
+You should see a banner and a task list like:
+
+```
+[tasks]
+  . posts.tasks.add
+  . posts.tasks.hello
+
+[... INFO/MainProcess] Connected to redis://127.0.0.1:6379/2//
+[... INFO/MainProcess] celery@yourhost ready.
+```
+
+Check that **your tasks appear** in the `[tasks]` list. If they don't, discovery failed (see the gotchas).
+
+## Part 6: Trigger a task
+
+In a third terminal, open the Django shell:
+
+```bash
+python manage.py shell
+```
+
+```python
+from posts.tasks import add, hello
+
+result = add.delay(2, 3)
+print(result)            # AsyncResult object, e.g. <AsyncResult: 6f0c...>
+print(result.id)         # the task id (a UUID)
+print(result.status)     # PENDING -> SUCCESS
+print(result.get(timeout=10))   # 5  (blocks until done; needs the result backend)
+
+hello.delay("alice")
+```
+
+Watch the **worker terminal**:
+
+```
+Task posts.tasks.add[6f0c...] received
+posts.tasks.add[6f0c...]: Adding 2 + 3
+Task posts.tasks.add[6f0c...] succeeded in 0.002s: 5
+```
+
+That log line appearing in the worker terminal, not the shell, is today's goal. The shell returned immediately, and the work happened in another process.
+
+### `delay` vs `apply_async`
+
+`delay(*args, **kwargs)` is shorthand. `apply_async` takes the same arguments plus options:
+
+```python
+add.delay(2, 3)
+add.apply_async(args=(2, 3))                    # same thing
+add.apply_async(args=(2, 3), countdown=30)      # run in 30 seconds
+add.apply_async(args=(2, 3), queue="emails")    # route to a named queue (later)
+add.apply_async(args=(2, 3), expires=60)        # discard if not started within 60s
+```
+
+### Two warnings about results
+
+- **Don't call `.get()` inside a web request.** It blocks the request until the task finishes, which defeats the purpose of going async. It's fine in the shell for learning.
+- **Most tasks shouldn't return anything.** Their result is a side effect (an email sent, a row updated). For those, add `ignore_result=True` to skip the backend write.
+
+## Part 7: See it in Redis (Day 14 payoff)
+
+Stop the worker (Ctrl+C), then queue some tasks from the shell:
+
+```python
+for i in range(5):
+    add.delay(i, i)
+```
+
+```bash
+redis-cli -n 2 LLEN celery          # 5: messages waiting in the broker
+redis-cli -n 2 LRANGE celery 0 0    # the JSON message envelope
+redis-cli -n 2 MONITOR              # keep open while you restart the worker
+```
+
+Now start the worker again. `LLEN celery` drops to 0 as it drains the queue, and all five tasks run. Two lessons in one:
+
+1. **The broker is just a Redis list** named `celery` (the default queue). `delay` pushes, and the worker pops.
+2. **Tasks survive a worker being down.** They wait in Redis. That's the durability benefit over doing work in-process.
+
+Results live in db 3: `redis-cli -n 3 --scan` shows `celery-task-meta-<id>` keys.
+
+## Part 8: Use it for real, move the Day 12 email out of the request
+
+Add a real task to **posts/tasks.py**:
+
+```python
+from django.core.mail import send_mail
+
+from .models import Post
+
+
+@shared_task(
+    autoretry_for=(OSError,),        # smtplib errors and connection failures inherit from OSError
+    retry_backoff=True,              # wait 1s, 2s, 4s... between retries
+    retry_backoff_max=300,
+    retry_kwargs={"max_retries": 3},
+    ignore_result=True,
+)
+def send_post_published_email(post_id):
+    post = Post.objects.select_related("author").filter(pk=post_id).first()
+    if post is None:
+        logger.warning("Post %s no longer exists; skipping email", post_id)
+        return
+    if not post.author.email:
+        return
+    send_mail(
+        subject=f'Your post "{post.title}" is live',
+        message=f"Hi {post.author.username}, your post was published.",
+        from_email=None,
+        recipient_list=[post.author.email],
+    )
+    logger.info("Emailed author of post %s", post_id)
+```
+
+Then change the Day 12 receiver in **posts/receivers.py**:
+
+```python
+from .tasks import send_post_published_email
+
+
+@receiver(post_published, sender=Post, dispatch_uid="email_author_published")
+def email_author(sender, post, **kwargs):
+    send_post_published_email.delay(post.pk)
+```
+
+Why this is written this way:
+
+- **Pass `post.pk`, not `post`.** The message must be JSON, and the worker should read **fresh data** from the database. By the time the task runs, the post might have been edited or deleted, which is why the task handles `None`.
+- **No new `on_commit` is needed.** Day 12's `Post.save()` already sends `post_published` via `transaction.on_commit`, so the receiver runs after the commit. If you ever call `.delay()` from code that is still inside a transaction, wrap it: `transaction.on_commit(lambda: task.delay(pk))`. Otherwise the worker can start before the row exists.
+- **`autoretry_for` with backoff** makes transient failures (SMTP down) retry on their own instead of silently losing the email.
+- **`send_robust` still protects you.** If the broker is down, `.delay()` raises, and `send_robust` logs that instead of turning a successful publish into a 500. The email is lost in that case, which is a real trade-off. A more durable design (an outbox table) is a stretch goal.
+
+Because you set `EMAIL_BACKEND` to the console backend on Day 12, the email now prints in the **worker** terminal, not the `runserver` one. Publish a draft in the admin and watch where it appears.
+
+Compare it with Day 12 Experiment 6: add `time.sleep(5)` to the task and publish through the admin. The page returns immediately and the 5-second wait happens in the worker.
+
+## Part 9: Test it
+
+Tests shouldn't need a worker or a broker. Use eager mode, where `.delay()` runs the task immediately in-process:
+
+```python
+from django.core import mail
+from django.test import TestCase, override_settings
+
+from .tasks import add, send_post_published_email
+
+
+@override_settings(CELERY_TASK_ALWAYS_EAGER=True, CELERY_TASK_EAGER_PROPAGATES=True)
+class TaskTests(TestCase):
+    def setUp(self):
+        self.author = User.objects.create_user(
+            "alice", email="alice@example.com", password="pass12345"
+        )
+
+    def test_add(self):
+        self.assertEqual(add.delay(2, 3).get(), 5)
+
+    def test_email_task_sends(self):
+        post = Post.objects.create(
+            author=self.author, title="Task post", slug="task-post", body="x" * 60
+        )
+        send_post_published_email.delay(post.pk)
+        self.assertEqual(len(mail.outbox), 1)
+
+    def test_email_task_skips_deleted_post(self):
+        send_post_published_email.delay(999999)        # must not raise
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_publish_triggers_email_task(self):
+        post = Post.objects.create(
+            author=self.author, title="Draft post", slug="draft", body="x" * 60
+        )
+        with self.captureOnCommitCallbacks(execute=True):
+            post.status = Post.Status.PUBLISHED
+            post.save()
+        self.assertEqual(len(mail.outbox), 1)
+```
+
+- `CELERY_TASK_ALWAYS_EAGER` makes `.delay()` run synchronously. `CELERY_TASK_EAGER_PROPAGATES` makes exceptions raise in the test instead of being swallowed into the result.
+- Your Day 12 test `test_author_is_emailed_on_publish` should still pass, because eager mode keeps the email inside the same test run. Add the override to that test class, or it will try to reach a real broker.
+- Eager mode skips serialization, so it **won't catch** "I passed a model instance" bugs. Keep the discipline of passing IDs and primitives.
+
+```bash
+python manage.py test posts
+```
+
+## Experiments (25 min)
+
+1. Run `add.delay(1, 2)` with the worker **stopped**, check `LLEN celery`, then start the worker and watch it drain.
+2. Start **two** workers (two terminals) and queue 20 tasks with `time.sleep(1)` in one. See them share the work, then check the process ids in the logs.
+3. Run `celery -A blog_platform worker -l INFO --concurrency=1` and compare timing with the default for 10 sleeping tasks. The default is the number of CPU cores.
+4. Make a task raise `OSError` and watch the retry log lines with growing delays.
+5. Call `add.apply_async(args=(1, 2), countdown=20)` and check Redis. Delayed tasks sit in the `unacked`/scheduled structures until due.
+6. Edit `tasks.py` while the worker is running, call the task, and see the **old code** run. Restart the worker, and the new code takes effect.
+7. Try `add.delay(Post.objects.first(), 1)` and read the serialization error.
+8. Run `celery -A blog_platform inspect registered` and `celery -A blog_platform inspect active` against the running worker.
+9. Stop Redis and call `.delay()`. See how it fails (it retries to connect for a while, so notice how long it blocks), then restart Redis.
+
+## Stretch goals
+
+- Run `pip install flower` and `celery -A blog_platform flower` for a web dashboard of workers and tasks (http://localhost:5555).
+- Replace the direct `.delay()` with an **outbox table**: write a row inside the transaction and let a task send pending rows. That removes the "broker down loses the email" hole.
+- Add a task that **warms the cache**: calls `get_popular_posts()` so Day 16's stampede protection rarely triggers.
+- Route emails to their own queue (`task_routes`) and start a worker with `-Q emails`.
+- Use `bind=True` and `self.request.id` / `self.retry(...)` to implement a manual retry.
+- Read ahead on `celery beat`, the scheduler that runs tasks periodically (Day 18 territory).
+
+## Day 17 checklist
+
+- [ ] `celery[redis]` installed, Redis running
+- [ ] `celery.py`, the `__init__.py` import, and `CELERY_*` settings in place
+- [ ] Broker on Redis db 2, separate from the cache on db 1
+- [ ] `add` and `hello` tasks defined with `@shared_task`
+- [ ] Worker started, and your tasks appear in its `[tasks]` list
+- [ ] `.delay()` returned instantly, and the log showed up in the **worker** terminal
+- [ ] Saw the queue as a Redis list (`LLEN celery`) and watched it drain
+- [ ] `send_post_published_email` replaces the synchronous receiver, taking `post_id`
+- [ ] Tests use eager mode and pass without a broker
+- [ ] Can explain why you pass IDs, not model instances
+- [ ] Can explain why the worker must be restarted after code changes
+
+## Common gotchas
+
+- **Tasks missing from the worker's `[tasks]` list**: the file isn't named `tasks.py`, the app isn't in `INSTALLED_APPS`, or `celery.py` and the `__init__.py` import are missing.
+- **`Received unregistered task of type ...`**: the worker started before you added the task, or with a different project. Restart it.
+- **Worker started from the wrong directory**: `-A blog_platform` must be importable. Run it where `manage.py` lives.
+- **Code changes ignored**: workers load code once. Restart after edits (or use `watchfiles`/`watchmedo` for dev auto-reload).
+- **Settings not picked up**: they must start with `CELERY_` because of `namespace="CELERY"`. `BROKER_URL` alone is ignored.
+- **`kombu.exceptions.EncodeError: Object of type X is not JSON serializable`**: you passed a model instance, `datetime`, `Decimal`, or QuerySet. Pass IDs and strings.
+- **Task runs before the data exists**: you called `.delay()` inside a transaction that hadn't committed. Use `transaction.on_commit`.
+- **Task reads stale or missing data**: the worker has its own DB connection and sees only committed rows. Re-fetch by ID inside the task.
+- **`.get()` in a request handler**: blocks the web worker, hiding the benefit and risking deadlocks. Don't do it.
+- **Results accumulating in Redis**: set `CELERY_RESULT_EXPIRES`, or `ignore_result=True` for fire-and-forget tasks.
+- **Windows crashes with the default pool**: use `--pool=solo` (or `threads`) for development.
+- **Tasks not idempotent**: a task can run **more than once** (retries, worker crash after starting but before acknowledging). Make them safe to repeat, e.g. check "already sent" before emailing.
+- **Long tasks and Redis visibility timeout**: for delayed tasks (`countdown`/`eta`) longer than an hour, the Redis broker may redeliver them. Raise `broker_transport_options = {"visibility_timeout": ...}` if you rely on this.
+- **No time limits**: a hung task holds a worker slot forever. Set `CELERY_TASK_TIME_LIMIT`.
+- **Broker down at publish time**: `.delay()` raises (after retrying). Decide whether the caller should fail, swallow, or fall back, instead of leaving it to chance.
+- **Exposing Redis**: the broker holds your task payloads. Same rule as Day 14: bind to localhost and require auth.
+- **Using the same Redis DB for cache and broker**: `FLUSHDB` on one wipes the other, so keep them separate.
+
+Day 18 is typically Celery beat and periodic tasks: scheduled jobs such as cache warming, cleaning up old drafts, and a daily digest email. Want that outline next?
