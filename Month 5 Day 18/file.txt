@@ -1,0 +1,480 @@
+# Day 18: Celery, Real Tasks
+
+## Part 1: Why async beats the request-response cycle
+
+Take "notify the post author when someone comments". There are two ways to build it.
+
+**Inline** (inside `CommentViewSet.perform_create`):
+
+```
+POST /comments/ ─► save comment ─► connect to SMTP ─► send mail ─► 201
+                                   └── 300ms to 30s, or an exception ──┘
+```
+
+**Async** (Celery):
+
+```
+POST /comments/ ─► save comment ─► task.delay(id) ─► 201   (milliseconds)
+                                        │
+                                        └─► Redis ─► worker ─► SMTP (retries if it fails)
+```
+
+| | Inline | Async |
+|---|---|---|
+| **Latency** | User waits for the slowest dependency | User waits only for the DB write |
+| **Failure** | SMTP down means a 500, or a silently lost email | Task retries with backoff; the comment is saved either way |
+| **Spikes** | 500 comments means 500 web workers blocked on SMTP | Requests stay fast; the queue absorbs the burst and workers drain it |
+| **Scaling** | Scale web servers for everything | Scale web and workers independently |
+| **Timeouts** | Gunicorn kills slow requests mid-send | Time limits are per task, and the request is long finished |
+
+Async isn't free:
+
+- **Eventual consistency**: the email arrives seconds later, not before the response.
+- **At-least-once delivery**: a task can run twice, so tasks must be idempotent.
+- **More moving parts**: broker, worker, and beat, each of which can be down or running old code.
+- **Harder debugging**: errors land in a worker log, not the HTTP response.
+
+Rule of thumb: use a task when the work is **slow, flaky, or doesn't affect the response**. Don't use one for a fast DB write the response depends on.
+
+## Part 2: Comment notification task
+
+### Model change: make the task safe to repeat
+
+Add a marker to `Comment` in **posts/models.py**:
+
+```python
+notified_at = models.DateTimeField(null=True, blank=True)
+```
+
+```bash
+python manage.py makemigrations && python manage.py migrate
+```
+
+If a worker crashes after sending but before finishing, Celery may redeliver the message. The marker lets the second run notice the work is done.
+
+### The task
+
+**posts/tasks.py**
+```python
+from celery import Task, shared_task
+from celery.utils.log import get_task_logger
+from django.core.mail import send_mail
+from django.utils import timezone
+
+from .models import Comment
+
+logger = get_task_logger(__name__)
+
+
+class LoggedTask(Task):
+    """Base class: log once when a task has failed for good (retries exhausted)."""
+
+    def on_failure(self, exc, task_id, args, kwargs, einfo):
+        logger.error("Task %s[%s] FAILED args=%s: %r", self.name, task_id, args, exc)
+
+
+@shared_task(base=LoggedTask, bind=True, max_retries=5, ignore_result=False)
+def send_comment_notification(self, comment_id):
+    comment = (
+        Comment.objects.select_related("post__author", "author")
+        .filter(pk=comment_id)
+        .first()
+    )
+    if comment is None:
+        logger.warning("Comment %s no longer exists; skipping", comment_id)
+        return "comment gone"
+    if comment.notified_at:
+        return "already notified"                       # idempotency guard
+
+    recipient = comment.post.author
+    if recipient.pk == comment.author_id:
+        return "skipped: commenting on own post"
+    if not recipient.email:
+        return "skipped: no email"
+
+    try:
+        send_mail(
+            subject=f'New comment on "{comment.post.title}"',
+            message=f"{comment.author.username} wrote:\n\n{comment.body}",
+            from_email=None,
+            recipient_list=[recipient.email],
+        )
+    except OSError as exc:                              # SMTP and connection errors
+        countdown = min(30 * 2 ** self.request.retries, 600)   # 30s, 60s, 120s... capped
+        logger.warning("Email failed (%r); retry %s in %ss",
+                       exc, self.request.retries + 1, countdown)
+        raise self.retry(exc=exc, countdown=countdown)
+
+    Comment.objects.filter(pk=comment.pk).update(notified_at=timezone.now())
+    return "sent"
+```
+
+Things to understand:
+
+- **`bind=True`** makes the task's first argument `self`, the task instance, which gives you `self.request.retries` and `self.retry()`.
+- **Pass `comment_id`, not the comment**, and re-fetch inside. The data may have changed or vanished by the time the worker runs, as on Day 17.
+- **Skip cases return strings**, which are visible in the result backend. A skipped task is a success, not a failure.
+- **`.update()` to set `notified_at`** is deliberate here: it avoids re-running `Comment`'s `post_save` receivers (the cache invalidation from Day 16) and a loop risk.
+- **Duplicate window**: if the worker dies between `send_mail` and the `update`, a redelivery sends a second email. Exactly-once delivery doesn't exist, so at-least-once plus a guard is the practical design.
+
+### Trigger it from a signal
+
+This is a new `post_save` receiver on `Comment` alongside Day 16's cache invalidation. Each has its own `dispatch_uid`, and they don't interfere. In **posts/receivers.py**:
+
+```python
+from django.db import transaction
+from django.db.models.signals import post_save
+from django.dispatch import receiver
+
+from .models import Comment
+from .tasks import send_comment_notification
+
+
+@receiver(post_save, sender=Comment, dispatch_uid="notify_on_comment")
+def notify_on_comment(sender, instance, created, raw=False, **kwargs):
+    if created and not raw:
+        pk = instance.pk
+        transaction.on_commit(
+            lambda: send_comment_notification.delay(pk),
+            robust=True,
+        )
+```
+
+- **`created`** stops edits from re-notifying.
+- **`on_commit`** guarantees the worker can see the row, which was Day 17's "task runs before the data exists" gotcha.
+- **`robust=True`** (Django 4.2+) logs an exception from the callback instead of raising it. Without it, a broker outage turns a successfully saved comment into a 500 after the commit. On older Django, wrap `.delay()` in `try/except` instead.
+
+**The signal-vs-explicit question from Day 12 applies again.** You could equally call `.delay()` from `CommentViewSet.perform_create`. The signal also catches comments created in the admin or shell. The explicit call is easier to trace. Pick one and write down why.
+
+## Part 3: Celery Beat, scheduled tasks
+
+**Celery Beat** is a scheduler process. It doesn't run tasks. At the scheduled time it **puts a message on the broker**, exactly as `.delay()` would, and a normal worker executes it.
+
+```
+beat (clock) ──► Redis queue ──► worker
+```
+
+### The nightly cleanup task
+
+Deleting data on a timer is risky, so the task is conservative: drafts only, a generous age, logged counts, and a dry-run switch.
+
+**posts/tasks.py**
+```python
+from datetime import timedelta
+
+from .models import Post
+
+
+@shared_task(base=LoggedTask, ignore_result=False)
+def delete_old_drafts(days=30, dry_run=False):
+    cutoff = timezone.now() - timedelta(days=days)
+    qs = Post.objects.filter(status=Post.Status.DRAFT, updated_at__lt=cutoff)
+
+    if dry_run:
+        count = qs.count()
+        logger.info("[dry run] would delete %s drafts older than %s days", count, days)
+        return {"dry_run": True, "would_delete": count}
+
+    _, per_model = qs.delete()
+    deleted = per_model.get("posts.Post", 0)
+    logger.info("Deleted %s old drafts (%s total rows incl. cascades)", deleted, sum(per_model.values()))
+    return {"deleted": deleted, "by_model": per_model}
+```
+
+- **`.delete()` fires signals** (Day 12), so your `pre_delete` log and Day 16 cache invalidation run for every draft. That's correct, and it's slower than raw SQL. For tens of thousands of rows, delete in batches of a few hundred, so one huge transaction doesn't lock tables.
+- **It returns `(total, per_model_dict)`**, and the total includes cascaded comments and likes, so read the per-model count for posts.
+- **It's idempotent by nature**: running it twice deletes nothing the second time.
+- **Parameters come from the schedule**, so the retention period is configuration, not code.
+
+### The schedule
+
+**settings.py**
+```python
+from celery.schedules import crontab
+
+CELERY_BEAT_SCHEDULE = {
+    "delete-old-drafts-nightly": {
+        "task": "posts.tasks.delete_old_drafts",
+        "schedule": crontab(hour=3, minute=0),     # 03:00 in CELERY_TIMEZONE (UTC)
+        "kwargs": {"days": 30},
+    },
+}
+```
+
+The key (`delete-old-drafts-nightly`) is just a label, and `"task"` is the dotted name that appears in the worker's `[tasks]` list. Crontab fields work like Unix cron: `crontab(minute="*/15")` is every 15 minutes, and `crontab(hour=9, day_of_week="mon")` is Mondays at 09:00.
+
+### Run it
+
+You now need **three processes** alongside Redis and `runserver`:
+
+```bash
+celery -A blog_platform worker -l INFO     # executes tasks
+celery -A blog_platform beat -l INFO       # schedules them (exactly ONE of these)
+```
+
+For local development only, you can combine them: `celery -A blog_platform worker -B -l INFO`. Don't do that in production, because every worker started that way runs its own scheduler and tasks fire multiple times.
+
+**Don't wait until 3 a.m. to test.** Temporarily use a fast schedule with a dry run:
+
+```python
+"schedule": 30.0,                                  # every 30 seconds
+"kwargs": {"days": 30, "dry_run": True},
+```
+
+Watch the beat terminal print `Scheduler: Sending due task ...` and the worker log `[dry run] would delete ...`. Restore the real schedule afterward.
+
+Beat creates a `celerybeat-schedule` file in the working directory to remember when each task last ran. Add it to `.gitignore`.
+
+## Part 4: Tracking task state with a results backend
+
+Day 17 used Redis as the result backend, where results expire. Today you'll try `django-celery-results`, which stores them in your database so you can browse them in the admin.
+
+```bash
+pip install django-celery-results
+```
+
+**settings.py**
+```python
+INSTALLED_APPS = [
+    # ...
+    "django_celery_results",
+    "posts",
+]
+
+CELERY_RESULT_BACKEND = "django-db"
+CELERY_RESULT_EXTENDED = True       # also store task name, args, kwargs, worker, queue
+CELERY_TASK_TRACK_STARTED = True    # adds the STARTED state (off by default)
+CELERY_RESULT_EXPIRES = 60 * 60 * 24 * 7    # keep a week
+```
+
+```bash
+python manage.py migrate
+```
+
+Restart the worker, trigger some tasks, then open `/admin/` and look at **Task results**. Each row shows the status, return value, traceback if it failed, and timestamps. This is how you answer "did that email go out?" after the fact.
+
+The states a task moves through:
+
+| State | Meaning |
+|---|---|
+| `PENDING` | Waiting, **or the id is unknown** (see gotchas) |
+| `STARTED` | A worker began it (needs `TRACK_STARTED`) |
+| `RETRY` | Failed, and a retry is scheduled |
+| `SUCCESS` | Finished; `result` holds the return value |
+| `FAILURE` | Raised; retries exhausted; `traceback` is stored |
+
+Check from the shell:
+
+```python
+from celery.result import AsyncResult
+r = AsyncResult("<task id>")
+r.status, r.result
+```
+
+Notes:
+
+- Results cost a write per task. For high-volume, fire-and-forget tasks, keep `ignore_result=True` (as `send_post_published_email` did on Day 17). We set `ignore_result=False` on today's tasks because you want to watch them.
+- With the `django-db` backend, Celery registers a built-in `celery.backend_cleanup` job that runs daily **when beat is running** and deletes results older than `CELERY_RESULT_EXPIRES`. So beat has a second job here.
+- This swaps out Day 17's db 3 results. Old results there are simply abandoned.
+- The tradeoff: DB results are queryable but add load to your main database. Redis results are fast but ephemeral. For serious monitoring, many teams use Flower or Sentry instead.
+
+## Part 5: Failure handling
+
+Three layers, from the inside out.
+
+**1. Decide what's retryable.** Transient errors (SMTP down, network blip, 503 from an API) deserve retries. Permanent ones (comment deleted, invalid address, a bug) don't, because retrying `DoesNotExist` five times just wastes workers. That's why the task catches only `OSError` and returns early for missing rows.
+
+**2. Retry with a countdown.** Your task does this by hand:
+
+```python
+raise self.retry(exc=exc, countdown=countdown)
+```
+
+- `self.retry()` **raises a `Retry` exception**, so nothing after it runs. That's why it's written `raise self.retry(...)`.
+- `countdown` is seconds before the next attempt. `30 * 2 ** retries` gives exponential backoff (30s, 60s, 120s, 240s, 480s), so a struggling SMTP server isn't hammered.
+- After `max_retries` is exceeded, Celery re-raises the original `exc`, the task goes to `FAILURE`, and `on_failure` runs.
+
+Day 17's declarative version does the same thing with less control:
+
+```python
+@shared_task(autoretry_for=(OSError,), retry_backoff=True, retry_jitter=True,
+             retry_kwargs={"max_retries": 5})
+```
+
+Use `autoretry_for` for simple cases. Use manual `self.retry` when you want conditional logic (retry on 503 but not 400) or custom countdowns.
+
+**3. Make "last resort" visible.** `LoggedTask.on_failure` logs the final failure. In production, hook Sentry here or in a failure signal. A task that fails after five retries and says nothing is the worst outcome.
+
+Also useful:
+
+```python
+@shared_task(bind=True, soft_time_limit=30, time_limit=45)
+def risky(self):
+    from celery.exceptions import SoftTimeLimitExceeded
+    try:
+        ...
+    except SoftTimeLimitExceeded:
+        # clean up, then fail or retry
+        ...
+```
+
+## Part 6: Tests
+
+Eager mode runs tasks inline, so no worker or broker is needed. Add to **posts/tests.py**:
+
+```python
+from datetime import timedelta
+from unittest import mock
+
+from celery.exceptions import Retry
+from django.core import mail
+from django.test import TestCase, override_settings
+from django.utils import timezone
+
+from .models import Comment, Post
+from .tasks import delete_old_drafts, send_comment_notification
+
+
+@override_settings(CELERY_TASK_ALWAYS_EAGER=True, CELERY_TASK_EAGER_PROPAGATES=True)
+class CommentNotificationTests(TestCase):
+    def setUp(self):
+        self.author = User.objects.create_user("alice", email="alice@example.com", password="x12345678")
+        self.commenter = User.objects.create_user("bob", email="bob@example.com", password="x12345678")
+        self.post = Post.objects.create(
+            author=self.author, title="Some post", slug="some-post",
+            body="x" * 60, status=Post.Status.PUBLISHED,
+        )
+
+    def make_comment(self, user):
+        with self.captureOnCommitCallbacks(execute=True):
+            return Comment.objects.create(post=self.post, author=user, body="Nice!")
+
+    def test_comment_emails_post_author(self):
+        c = self.make_comment(self.commenter)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, ["alice@example.com"])
+        c.refresh_from_db()
+        self.assertIsNotNone(c.notified_at)
+
+    def test_no_email_for_own_post(self):
+        self.make_comment(self.author)
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_task_is_idempotent(self):
+        c = self.make_comment(self.commenter)
+        send_comment_notification.delay(c.pk)             # run it a second time
+        self.assertEqual(len(mail.outbox), 1)
+
+    def test_deleted_comment_is_skipped(self):
+        self.assertEqual(send_comment_notification.delay(999999).get(), "comment gone")
+
+    def test_smtp_failure_schedules_retry_with_countdown(self):
+        c = self.make_comment(self.commenter)
+        Comment.objects.filter(pk=c.pk).update(notified_at=None)
+        with mock.patch("posts.tasks.send_mail", side_effect=OSError("smtp down")), \
+             mock.patch.object(send_comment_notification, "retry", side_effect=Retry()) as retry:
+            with self.assertRaises(Retry):
+                send_comment_notification(c.pk)           # direct call: retries == 0
+        self.assertEqual(retry.call_args.kwargs["countdown"], 30)
+
+
+class DeleteOldDraftsTests(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user("alice", password="x12345678")
+
+    def make(self, slug, status, age_days):
+        p = Post.objects.create(author=self.user, title=slug.title() * 2, slug=slug,
+                                body="x" * 60, status=status)
+        # .update() bypasses auto_now (Day 5), which lets us backdate updated_at
+        Post.objects.filter(pk=p.pk).update(updated_at=timezone.now() - timedelta(days=age_days))
+        return p
+
+    def test_only_old_drafts_are_deleted(self):
+        self.make("old-draft", Post.Status.DRAFT, 40)
+        self.make("new-draft", Post.Status.DRAFT, 5)
+        self.make("old-published", Post.Status.PUBLISHED, 400)
+        result = delete_old_drafts(days=30)
+        self.assertEqual(result["deleted"], 1)
+        self.assertEqual(set(Post.objects.values_list("slug", flat=True)),
+                         {"new-draft", "old-published"})
+
+    def test_dry_run_deletes_nothing(self):
+        self.make("old-draft", Post.Status.DRAFT, 40)
+        self.assertEqual(delete_old_drafts(days=30, dry_run=True)["would_delete"], 1)
+        self.assertEqual(Post.objects.count(), 1)
+```
+
+The retry test patches `retry` on the task object, because `self` inside a bound task is that object. Calling the task directly (`send_comment_notification(c.pk)`) runs it synchronously with `request.retries == 0`, so the expected countdown is `30 * 2**0 = 30`. The point of the test is the policy: which error, what delay. Eager mode can't test real redelivery.
+
+```bash
+python manage.py test posts
+```
+
+## Part 7: Try it for real
+
+Start Redis, `runserver`, a worker, and beat (four terminals), then:
+
+1. Log in as `bob` (token or browsable API) and `POST /api/posts/<alice's slug>/comments/`. The response returns immediately, and the email prints in the **worker** terminal.
+2. Open the admin's **Task results** and find the run, its status, and its return value.
+3. Make SMTP fail: set `EMAIL_HOST = "localhost"`, `EMAIL_PORT = 1`, and the SMTP backend. Comment again, then watch the worker log the retries at 30s, 60s, and so on, with the status showing `RETRY`. Restore the console backend and watch a later retry succeed (or the final `FAILURE` log after five).
+4. Use the 30-second dry-run schedule to see beat firing the cleanup.
+
+## Experiments (25 min)
+
+1. Time the comment POST with `curl -w '%{time_total}'` using inline `send_mail` plus `time.sleep(3)`, then with the task. The inline version takes 3 seconds longer, and the async one doesn't.
+2. Kill the worker mid-retry (Ctrl+C), then restart it. Check whether the retry still happens. Compare a warm shutdown with `kill -9`.
+3. Set `CELERY_TASK_ACKS_LATE = True`, kill a worker mid-task with `kill -9`, and see the task redelivered. Then think about what that means for idempotency.
+4. Start **two** beat processes briefly and see tasks fire twice. This is the reason to run exactly one.
+5. Change `CELERY_TIMEZONE` to your local zone and see how the crontab hour shifts.
+6. `Post.objects.filter(...).update(updated_at=...)` to backdate a draft, run the task manually with `delete_old_drafts.delay(days=30)`, and watch your cache invalidation logs fire for the deleted post.
+7. Raise `ValueError` inside the task and confirm it isn't retried, only failed.
+8. Look up a task id that doesn't exist with `AsyncResult("nonsense").status` and see `PENDING`.
+
+## Stretch goals
+
+- Install `django-celery-beat` to manage schedules from the admin instead of `settings.py`: `CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"`.
+- Add a weekly digest task: top 5 posts by `like_count` from Day 16's `get_popular_posts`, emailed to everyone with a `Profile` opt-in.
+- Add a cache-warming periodic task that calls `get_popular_posts()` every 4 minutes, so users basically never hit a miss.
+- Route notifications to a dedicated queue: `task_routes` plus `worker -Q notifications`.
+- Build the **outbox** version: write a `Notification` row in the same transaction as the comment, and let a periodic task send pending rows. That fixes the "broker down loses the notification" hole.
+- Add `GET /api/tasks/<id>/` (staff only) returning `AsyncResult` status.
+- Run Flower (`pip install flower`) and watch retries live.
+
+## Day 18 checklist
+
+- [ ] Can explain three concrete benefits of async over inline, and two costs
+- [ ] `Comment.notified_at` added with a migration
+- [ ] `send_comment_notification(comment_id)` triggered via `post_save` and `on_commit`
+- [ ] Task skips own-post comments, missing comments, and already-notified comments
+- [ ] Retries use exponential `countdown` via `self.retry`
+- [ ] `delete_old_drafts` with a `dry_run` option and a nightly crontab
+- [ ] Ran worker and beat together and saw a scheduled task fire
+- [ ] `django-celery-results` installed, migrated, results visible in the admin
+- [ ] Can name the five task states and explain why `PENDING` is ambiguous
+- [ ] Can distinguish transient errors from permanent ones
+- [ ] Tests pass in eager mode, including idempotency and the retry policy
+- [ ] Can explain why you run exactly one beat
+
+## Common gotchas
+
+- **Beat runs but nothing happens**: no worker is running, or the `"task"` name doesn't match the `[tasks]` list exactly.
+- **Task fires twice**: two beat processes, or `worker -B` on multiple workers. Run one beat.
+- **Schedule changes ignored**: restart beat after editing `settings.py`, because it reads the schedule at startup. Also delete a stale `celerybeat-schedule` file if odd behavior persists.
+- **Wrong time zone**: crontab hours use `CELERY_TIMEZONE`. Check it before trusting "3 a.m.".
+- **`PENDING` forever**: either the task hasn't started, or the id doesn't exist (Celery can't distinguish them), or you set `ignore_result=True` so no state is stored.
+- **`STARTED` never appears**: it's off unless `CELERY_TASK_TRACK_STARTED = True`.
+- **Retrying everything**: `autoretry_for=(Exception,)` retries bugs and `DoesNotExist` five times. Be specific.
+- **Forgetting `raise` before `self.retry()`**: without it, execution continues after the call.
+- **Retries with no cap**: always set `max_retries`, and cap the countdown, or one outage creates an endless retry backlog.
+- **Non-idempotent tasks**: retries and redelivery mean double runs. Guard with a marker like `notified_at` or a unique key.
+- **Passing objects instead of IDs**: still a JSON serialization error, and eager mode won't show it.
+- **`.delay()` called before commit**: the worker can't find the row. Use `on_commit`.
+- **Broker down during `on_commit`**: without `robust=True` (or a `try/except`), the user gets a 500 for a comment that was saved.
+- **Destructive schedules without a safety net**: add a dry run, a conservative cutoff, and logged counts. Back up before the first real run.
+- **Huge single-transaction deletes**: batch large cleanups.
+- **Result table growth**: results are rows in your DB. Set `CELERY_RESULT_EXPIRES` and keep beat running for `backend_cleanup`.
+- **Worker running old code**: restart it after every edit to `tasks.py`.
+- **Expecting ordering**: with multiple workers, tasks complete in no guaranteed order.
+- **Treating the queue as storage**: Redis can lose queued messages if it crashes without persistence. For must-not-lose work, record it in the database first (the outbox pattern).
+
+Day 19 is usually a week 3 review, like Days 6 and 13: rebuild cache, signals, and Celery from memory in a fresh project, test the whole flow end to end, and compare Celery with alternatives such as RQ or FastAPI's `BackgroundTasks`. Want that outline next?
