@@ -1,0 +1,399 @@
+# Day 19: Review Week 3
+
+This week's pieces (cache, signals, Celery) only matter together. Today you demo the integration, break Redis on purpose, and draw the full path. As in Days 6 and 13, **predict the behavior before you run each step**.
+
+## Part 0: A bug from Days 9 and 10 that Day 15 exposes
+
+The `popular` action from Day 15 sets `permission_classes=[AllowAny]` in its decorator. But the `get_permissions()` override from Day 10 builds its own list per action and ignores that kwarg. `popular` falls into the `else` branch, so an anonymous request gets **401** instead of the cached list. Fix it:
+
+```python
+def get_permissions(self):
+    if self.action in ("list", "retrieve", "popular"):
+        permission_classes = [AllowAny]
+    else:  # create, update, partial_update, destroy, like
+        permission_classes = [IsAuthenticated, IsAuthorOrReadOnly]
+    return [permission() for permission in permission_classes]
+```
+
+The `permission_classes=` argument to `@action` only applies if `get_permissions()` is the default. Once you override it, the override wins. Add a test so it can't regress:
+
+```python
+def test_popular_is_public(self):
+    self.assertEqual(self.client.get("/api/posts/popular/").status_code, 200)
+```
+
+## Part 1: The full request path
+
+Draw this on paper **without looking**, then compare. Label each box with the file where it lives and the Redis DB number it touches.
+
+### Path A: `GET /api/posts/popular/` (cache)
+
+```
+Browser
+  │  GET /api/posts/popular/
+  ▼
+gunicorn / runserver ─► middleware ─► blog_platform/urls.py ─► posts/api_urls.py (router)
+                                                                   │
+                                                                   ▼
+                                                   PostViewSet.popular()  (views.py)
+                                                                   │
+                                                          get_popular_posts()
+                                                                   │
+                                       cache.get("popular_posts") ─────────► Redis db 1
+                                         │                                    "blog:1:popular_posts"
+                              ┌──────────┴──────────┐
+                            HIT                    MISS
+                              │                      │
+                              │            cache_lock (Redis lock, db 1)
+                              │              re-check cache inside the lock
+                              │              _build_popular() ──► Database (SELECT + annotate)
+                              │              cache.set(..., jittered TTL) ──► Redis db 1
+                              ▼                      ▼
+                          Response(data) ◄───────────┘
+```
+
+### Path B: `POST /api/posts/{slug}/comments/` (write + async)
+
+```
+Browser ─► ... ─► CommentViewSet.create()
+                     │  serializer.save(author=..., post=...)
+                     ▼
+              INSERT comment ──► Database
+                     │
+                     ▼  post_save(Comment) fires TWO receivers (posts/receivers.py)
+          ┌──────────┴───────────────────────────┐
+          │                                      │
+ invalidate_on_child_change            notify_on_comment
+ transaction.on_commit(...)            transaction.on_commit(..., robust=True)
+          │                                      │
+          └───────────── COMMIT ─────────────────┘
+          │                                      │
+ cache.delete("post:{slug}:detail")    send_comment_notification.delay(pk)
+          │ ──► Redis db 1                       │ ──► LPUSH to list "celery" in Redis db 2
+          ▼                                      ▼
+                  201 Created returned to browser (milliseconds)
+
+   ... later, in a different process ...
+
+Celery worker ──► BRPOP "celery" (db 2)
+      │
+      ├─► re-fetch Comment by id (Database)
+      ├─► already notified? skip. Own post? skip.
+      ├─► send_mail ──► SMTP (console backend in dev: printed in the WORKER terminal)
+      │       └─ OSError ─► self.retry(countdown=30·2ⁿ) ─► back onto the queue
+      ├─► UPDATE comment SET notified_at ──► Database
+      └─► store result ──► django-celery-results table (Database)
+```
+
+Two details people get wrong:
+
+- **When does `.delay()` run?** Without `ATOMIC_REQUESTS`, each `save()` autocommits, so the `on_commit` callback runs immediately inside `save()`, still within the request. All it does is push a small message to Redis (a few milliseconds), not send the email. With `ATOMIC_REQUESTS = True`, callbacks run after the view returns. Either way the guarantee holds: **the worker can't see the task before the row is committed.**
+- **Four stores, four jobs.** Database = truth. Redis db 1 = disposable copies. Redis db 2 = the queue (at-least-once, can lose messages if Redis loses data). Task-results table = history.
+
+## Part 2: Demo 1, popular posts served from Redis
+
+Seed 500+ posts and a few likes first, so the difference is visible. Use four terminals: `runserver`, `redis-cli -n 1 MONITOR`, a scratch shell, and one for `curl`.
+
+```bash
+redis-cli -n 1 FLUSHDB
+
+for i in 1 2 3 4 5; do
+  curl -s -o /dev/null -w "request $i: ttfb=%{time_starttransfer}s total=%{time_total}s\n" \
+    http://127.0.0.1:8000/api/posts/popular/
+done
+```
+
+**Predict first:** which request is slow, and what will `MONITOR` show for request 1 versus request 2?
+
+- **Request 1 (miss):** a `GET`, then the lock commands (`SET ... NX`), a second `GET`, then a `SET`/`SETEX` with the value, then the lock release.
+- **Requests 2 to 5 (hit):** exactly one `GET` each, and no database queries.
+
+Then inspect:
+
+```bash
+redis-cli -n 1 --scan                      # find blog:1:popular_posts
+redis-cli -n 1 TTL "blog:1:popular_posts"   # 300 to 360 seconds, thanks to the jitter
+```
+
+Now confirm **both invalidation policies** from Day 16:
+
+1. **Edit a post in the admin**, then run `curl` again. The post receiver deleted `popular_posts` after commit, so you see one miss, then hits again.
+2. **Like a post** through `POST /api/posts/{slug}/like/`, then `curl` the popular list. It does **not** change. Likes are deliberately TTL-only, so the cache is stale for up to ~6 minutes. That's the trade-off you chose on Day 16, now observed.
+
+## Part 3: Demo 2, comment → async task → worker log
+
+Terminals: Redis, `runserver`, `celery -A blog_platform worker -l INFO`, and one for `curl`. Add `beat` if you want the full set running.
+
+Setup: `alice` owns a published post and has an email address. `bob` is a different user and has a token.
+
+```bash
+TOKEN=<bob's token>
+curl -s -o /dev/null -w "status=%{http_code} total=%{time_total}s\n" \
+  -X POST http://127.0.0.1:8000/api/posts/<alice-post-slug>/comments/ \
+  -H "Authorization: Token $TOKEN" -H "Content-Type: application/json" \
+  -d '{"body": "Great post!"}'
+```
+
+**Predict:** which terminal shows the email, and how long does `curl` take?
+
+What you should see:
+
+| Where | What |
+|---|---|
+| `curl` | `status=201`, fast |
+| `runserver` | the request line only, with **no email** |
+| Worker | `Task posts.tasks.send_comment_notification[<id>] received`, then the console email, then `succeeded in ...s: 'sent'` |
+| Admin → Task results | a `SUCCESS` row with result `sent` |
+| `redis-cli -n 2 LLEN celery` | `0` (drained) |
+
+Then run these three variants:
+
+1. **Same comment as alice** (on her own post). The worker logs the task, and the result is `skipped: commenting on own post`. A skip is a success, not a failure.
+2. **Stop the worker**, post a comment, and run `LLEN celery`. It shows `1`, so the work is waiting. Start the worker and it runs.
+3. **Break SMTP** (`EMAIL_PORT = 1` with the SMTP backend). Watch the worker retry at 30s, 60s, and so on, with `RETRY` in the admin. Restore the console backend and it eventually succeeds.
+
+## Part 4: What happens if Redis goes down?
+
+Redis plays three roles in your app: **cache** (db 1), **broker** (db 2), and **raw client** (Day 14 counters, db 0). The database holds everything authoritative, which is why this is survivable.
+
+### Predicted behavior (verify each one)
+
+| Feature | Redis down | Verdict |
+|---|---|---|
+| `GET /api/posts/` (anonymous) | `IGNORE_EXCEPTIONS` turns every read into a miss, so the DB serves it and the write-back is silently skipped | **Works, slower** |
+| `GET /api/posts/popular/` | Lock acquisition raises `RedisError`, which you catch, then `_build_popular()` runs directly on **every** request | **Works, DB load up** |
+| Token login, permissions | Tokens and users live in the database | **Unaffected** |
+| `POST` comment | Row saved. The cache `DEL` is silently ignored. `.delay()` fails, and `robust=True` logs it | **201, notification lost** |
+| Publish a post | `send_robust` logs the failed `.delay()` | **Publish succeeds, email lost** |
+| Worker | Logs connection errors, retries automatically, resumes when Redis returns | **Paused** |
+| Messages in flight | A task finishing while the connection is broken may fail to acknowledge and be **redelivered** later | **Idempotency matters** |
+| Beat | Can't enqueue scheduled tasks. Don't assume missed runs are replayed | **Missed run** |
+| Task results | `django-db` backend lives in the database | **Unaffected** |
+| DRF throttling | It reads its counters from the cache, so with `IGNORE_EXCEPTIONS` it **fails open**: limits stop applying | **Protection gone** |
+| Day 14 raw `redis.Redis` counters | Not covered by `IGNORE_EXCEPTIONS` | **500s unless you wrap them** |
+
+Three things are easy to miss:
+
+1. **Stale entries after recovery.** Invalidations that happened during the outage were lost. When Redis returns with its old keys, old entries live until their TTL (at most ~6 minutes). This is exactly why Day 16 treated the TTL as the safety net.
+2. **Down and unreachable behave differently.** A stopped local Redis refuses connections instantly, so requests stay fast. A network partition makes each cache call **wait for a socket timeout**, which can slow *every* request. Set timeouts (below).
+3. **Data loss vs outage.** If Redis restarts, you lose whatever its persistence didn't capture. A lost cache is a non-event, but **queued tasks are lost** too. Anything that mustn't be lost needs a database record, which is the outbox idea and today's sweep task.
+
+### The drill (20 min)
+
+Write down predictions for each row first, then:
+
+```bash
+docker stop redis        # or: brew services stop redis
+```
+
+1. `curl` the list, detail, and popular endpoints, and note the status codes and times.
+2. Post a comment and check the worker and runserver logs.
+3. Publish a draft in the admin and check the logs.
+4. Run `python manage.py shell` and try `r.incr(...)` with your Day 14 client.
+5. `docker start redis`, then watch the worker reconnect.
+6. Check whether the comment from step 2 ever got its email. It won't, and that's the gap to fix.
+
+### Harden it
+
+**1. Socket timeouts** (`settings.py`), so a hung Redis can't stall requests:
+
+```python
+CACHES["default"]["OPTIONS"].update({
+    "SOCKET_CONNECT_TIMEOUT": 1,
+    "SOCKET_TIMEOUT": 1,
+})
+
+CELERY_BROKER_TRANSPORT_OPTIONS = {"socket_connect_timeout": 2}
+CELERY_TASK_PUBLISH_RETRY_POLICY = {
+    "max_retries": 1, "interval_start": 0, "interval_step": 0.2, "interval_max": 0.5,
+}
+```
+
+The publish policy makes `.delay()` give up in about a second instead of blocking a web worker. Don't set a low `socket_timeout` on the broker, because workers rely on long blocking reads. Check these option names against your Celery and django-redis versions.
+
+**2. Wrap raw Redis use**, since `IGNORE_EXCEPTIONS` doesn't cover it:
+
+```python
+import logging
+import redis
+logger = logging.getLogger(__name__)
+
+def safe_incr(key):
+    try:
+        return r.incr(key)
+    except redis.exceptions.RedisError:
+        logger.warning("Redis unavailable; dropped counter %s", key)
+        return None
+```
+
+**3. A sweep task** that re-queues comments whose notification never went out:
+
+```python
+from datetime import timedelta
+from django.utils import timezone
+
+@shared_task(ignore_result=True)
+def requeue_unsent_notifications(grace_minutes=5, max_age_hours=1):
+    now = timezone.now()
+    ids = (
+        Comment.objects.filter(
+            notified_at__isnull=True,
+            created_at__lt=now - timedelta(minutes=grace_minutes),
+            created_at__gt=now - timedelta(hours=max_age_hours),
+        ).values_list("pk", flat=True)[:200]
+    )
+    for pk in ids:
+        send_comment_notification.delay(pk)
+```
+
+```python
+"requeue-unsent-notifications": {
+    "task": "posts.tasks.requeue_unsent_notifications",
+    "schedule": crontab(minute="*/10"),
+},
+```
+
+Two traps here. Without the `max_age_hours` bound, the first run would email about **every old comment** created before `notified_at` existed. And comments that are legitimately skipped (own post, no email) keep `notified_at = None`, so they get re-queued each run within the window. That's harmless because they skip again cheaply, but the cleaner fix is to stamp a "handled" time in the skip branches too.
+
+**4. A health endpoint** that reports degraded instead of dead:
+
+```python
+from django.core.cache import cache
+from django.db import connection
+from rest_framework.permissions import AllowAny
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from blog_platform.celery import app as celery_app
+
+
+class HealthView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+    throttle_classes = []
+
+    def get(self, request):
+        checks = {}
+        try:
+            connection.ensure_connection()
+            checks["database"] = "ok"
+        except Exception:
+            checks["database"] = "down"
+
+        cache.set("health:ping", 1, 5)          # errors are swallowed, so verify by reading back
+        checks["cache"] = "ok" if cache.get("health:ping") == 1 else "down"
+
+        try:
+            with celery_app.connection_for_write() as conn:
+                conn.ensure_connection(max_retries=1)
+            checks["broker"] = "ok"
+        except Exception:
+            checks["broker"] = "down"
+
+        if checks["database"] != "ok":
+            status_code, overall = 503, "down"
+        elif "down" in checks.values():
+            status_code, overall = 200, "degraded"
+        else:
+            status_code, overall = 200, "ok"
+        return Response({"status": overall, **checks}, status=status_code)
+```
+
+Redis down is *degraded*, database down is *down*. A load balancer should only pull a server out of rotation for the second.
+
+**5. A test that the cache outage is survivable**, which needs no running Redis (django-redis must be installed):
+
+```python
+DEAD_REDIS = {
+    "default": {
+        "BACKEND": "django_redis.cache.RedisCache",
+        "LOCATION": "redis://127.0.0.1:1/1",       # nothing listens on port 1
+        "OPTIONS": {
+            "CLIENT_CLASS": "django_redis.client.DefaultClient",
+            "IGNORE_EXCEPTIONS": True,
+        },
+    }
+}
+
+@override_settings(CACHES=DEAD_REDIS)
+class RedisOutageTests(APITestCase):
+    def test_popular_and_list_survive_cache_outage(self):
+        self.assertEqual(self.client.get("/api/posts/popular/").status_code, 200)
+        self.assertEqual(self.client.get("/api/posts/").status_code, 200)
+```
+
+I'm deliberately not giving you an automated broker-outage test. Django's `captureOnCommitCallbacks` may not honor `robust=True`, so a test could fail for the wrong reason. Verify the broker case with the manual drill above.
+
+## Part 5: Fresh-project rebuild (45 min, time-boxed)
+
+A full rebuild is too big this week, so rebuild only the new slice in a **fresh project**, without notes:
+
+1. `CACHES` pointing at Redis db 1 with `IGNORE_EXCEPTIONS`
+2. A cache-aside `get_popular_posts()` with `MISSING`, jitter, and a Redis lock
+3. `celery.py`, the `__init__.py` import, and `CELERY_*` settings (broker db 2)
+4. One task with `bind=True`, an idempotency marker, and `self.retry(countdown=...)`
+5. A `post_save` receiver using `on_commit`, registered in `ready()`
+
+Self-check:
+
+- [ ] `namespace="CELERY"` and every setting starts with `CELERY_`
+- [ ] The task takes an **id**, not a model, and re-fetches inside
+- [ ] `raise self.retry(...)` has the `raise`
+- [ ] `.delay()` is inside `on_commit`
+- [ ] Cache values are plain data, never QuerySets or model instances
+- [ ] Anonymous-only caching for anything user-dependent
+- [ ] Worker restarted after every edit to `tasks.py`
+
+Scoring: 6 or 7 ticked is solid. Below 5, redo Day 17 Parts 3 to 6.
+
+## Part 6: Write your own answers
+
+Before reading any notes, answer these in your own words:
+
+1. Name three costs of doing the notification inline, and two costs of doing it with Celery.
+2. Why must `delete_pattern`, `.delay()`, and the cache `DEL` all wait for commit?
+3. Which of today's failures lose data permanently, and which only slow things down?
+4. Why is `IGNORE_EXCEPTIONS` a trade-off and not a pure win? (Throttling fails open, outages go unnoticed, DB load spikes.)
+5. What would you move into the database to make "never lose a notification" true? (An outbox row written in the same transaction.)
+
+## Part 7: Gap list (10 min)
+
+Three lines in `NOTES.md`, as before: one thing you got wrong or forgot, one thing you want to understand more deeply, and one thing you could teach.
+
+## Stretch goals
+
+- Add `X-Cache: HIT/MISS` to `popular` and watch it flip during the drill.
+- Run `celery -A blog_platform inspect ping` while Redis is down, then after it's back.
+- Enable Redis persistence (`appendonly yes`), repeat the "restart Redis with queued tasks" experiment, and compare the loss.
+- Build the real outbox: a `Notification` row saved in the comment's transaction, drained by a periodic task.
+- Add `flower` and watch the retry storm during an SMTP outage.
+
+## Day 19 checklist
+
+- [ ] Fixed the `popular` permission bug and added the test
+- [ ] Drew both request paths from memory, then compared
+- [ ] Demo 1: observed a miss, hits, the TTL, and both invalidation policies
+- [ ] Demo 2: saw the email in the **worker** terminal and the result row in the admin
+- [ ] Predicted, then verified, the Redis-down table
+- [ ] Added socket timeouts and wrapped the raw Redis client
+- [ ] Wrote (or at least read through) the sweep task and its two traps
+- [ ] Health endpoint distinguishes degraded from down
+- [ ] Rebuilt the cache + Celery slice in a fresh project
+- [ ] Wrote your own answers to the five questions and the gap list
+
+## Common gotchas
+
+- **Overridden `get_permissions` ignoring `@action(permission_classes=...)`**: the override wins, so add the action to your own lists.
+- **`IGNORE_EXCEPTIONS` hiding outages**: nothing errors, so you only notice when the DB is hot. Alert on the health endpoint or on cache hit rate.
+- **No socket timeouts**: a partitioned Redis makes every request wait, which is worse than a clean refusal.
+- **Raw `redis.Redis` calls in views**: not covered by django-redis's exception handling.
+- **Throttling relying on a cache that fails open**: your brute-force protection quietly disappears.
+- **Treating the queue as durable**: Redis can lose queued messages. Anything that matters needs a database record.
+- **Duplicate runs after reconnects**: unacknowledged tasks get redelivered, so keep tasks idempotent.
+- **A sweep task without an age bound**: it re-sends everything old.
+- **`on_commit` assumed to run after the response**: without `ATOMIC_REQUESTS` it runs inside `save()`, during the request.
+- **Debugging in the wrong terminal**: emails and task logs appear in the worker, not `runserver`.
+- **Worker running old code**: restart it after each change.
+- **Forgetting the DB-number split**: `FLUSHDB` on db 2 deletes your queue, and on db 1 only your cache.
+
+Day 20 would normally start a new block (Docker and deployment, or API testing and CI). Want that outline next?
