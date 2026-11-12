@@ -1,0 +1,294 @@
+# Day 20: Scaling, Vertical vs Horizontal
+
+Today is mostly concepts, but we'll anchor them to your blog project. The practical question is: **if I started a second copy of this app right now, what would break?**
+
+## Part 1: The two directions
+
+**Vertical scaling (scale up):** give one machine more CPU, RAM, disk, or faster storage.
+
+**Horizontal scaling (scale out):** run more machines or processes behind a **load balancer** that spreads requests across them.
+
+```
+Vertical                      Horizontal
+┌───────────┐                       ┌─► [app 1]
+│ BIGGER    │        client ─► LB ──┼─► [app 2] ─► shared DB / Redis
+│ app + DB  │                       └─► [app 3]
+└───────────┘
+```
+
+| | Vertical | Horizontal |
+|---|---|---|
+| **Effort** | Low: resize the box, no code changes | Higher: the app must tolerate running as N copies |
+| **Ceiling** | Hard limit (largest machine available), and cost grows faster than capacity | Far higher: add nodes as needed |
+| **Failure** | One machine is a **single point of failure** | Lose a node, the rest keep serving |
+| **Downtime** | Usually a restart to resize | Rolling deploys with zero downtime |
+| **Complexity** | Almost none | Load balancer, shared state, deployment orchestration, harder debugging |
+| **Best for** | Early stage, databases, anything hard to split | Stateless web and worker tiers |
+
+Practical advice: **scale vertically first** while it's cheap and simple, and go horizontal when you hit the ceiling, need redundancy, or want zero-downtime deploys. Many real systems do both: a big database server and many small app servers.
+
+Two related ideas to be able to name:
+
+- **Capacity vs availability.** More nodes gives you both, but only if nodes are interchangeable.
+- **Scale each tier independently.** Web servers, Celery workers, Redis, and the database have different bottlenecks. Day 18's async design lets you add workers without adding web servers.
+
+## Part 2: Statelessness is the prerequisite
+
+A server is **stateless** if any request can be handled by any instance, because everything the request needs arrives with it or lives in a shared store. Nothing important lives in one process's memory or on one machine's disk between requests.
+
+| Kind of state | Stateful (breaks scaling) | Stateless fix |
+|---|---|---|
+| Login sessions | In-process dict, local files | Signed token (JWT), or sessions in the shared DB or Redis |
+| Cache | `LocMemCache` (one per process) | Redis (what you did on Day 15) |
+| Counters / rate limits | Python variable, LocMem | Redis `INCR` |
+| Uploaded files | `MEDIA_ROOT` on local disk | Object storage (S3 or similar) |
+| Scheduled jobs | Beat in each web process | Exactly one beat process |
+| Database | SQLite file on one machine | A network database (PostgreSQL) |
+| Config and secrets | Edited by hand on each server | Environment variables, same for all |
+
+The rule behind the table is **share-nothing app servers; put state in a store everyone can reach.**
+
+Statelessness also helps under vertical scaling: gunicorn already runs several worker processes on one machine, and each is effectively its own "server". The bugs below appear on a single box long before you buy a second one.
+
+## Part 3: JWT and horizontal scaling, with an honest correction
+
+The claim in your outline is "JWT makes horizontal scaling easy, with no session server". It's partly right, so here are the precise parts.
+
+**What JWT does.** The server signs a token containing the user id and an expiry. Any instance holding the same secret can **verify it with no lookup**: no database, no Redis.
+
+```
+Authorization: Bearer eyJhbGciOi...   (header.payload.signature)
+```
+
+**What's misleading.** Your Day 10 `TokenAuthentication` is *already* stateless from the app server's point of view. The token lives in the `authtoken_token` table, and every instance checks the same database, so any instance can serve any request. And classic server-side sessions in a shared store (DB or Redis) scale horizontally too. The real enemy is **session data in one server's memory or disk**, plus sticky sessions to work around it.
+
+So the accurate comparison is:
+
+| | DRF `Token` (Day 10) | JWT | Shared-store sessions |
+|---|---|---|---|
+| Per-request check | 1 DB lookup | Signature check, **no I/O** | 1 cache or DB lookup |
+| Works across N instances | Yes (shared DB) | Yes (shared secret) | Yes (shared store) |
+| **Revocation** | Delete the row: instant | **Hard**: valid until it expires | Delete the session: instant |
+| Expiry | None by default | Built in | Configurable |
+| Token holds data | No | Yes (claims), visible to the client | No |
+
+JWT's true advantage is **removing a dependency from the hot path**. Its cost is **revocation**: you can't un-issue a token already in the wild. The usual compromise is short-lived access tokens (about 5 to 15 minutes) plus a refresh token. And if you add a refresh-token blacklist, you've reintroduced a shared lookup, though only at refresh time and not on every request.
+
+### Try it (30 min)
+
+```bash
+pip install djangorestframework-simplejwt
+```
+
+**settings.py**
+```python
+from datetime import timedelta
+
+REST_FRAMEWORK["DEFAULT_AUTHENTICATION_CLASSES"] = [
+    "rest_framework_simplejwt.authentication.JWTAuthentication",
+    "rest_framework.authentication.TokenAuthentication",     # keep both during migration
+    "rest_framework.authentication.SessionAuthentication",
+]
+
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=10),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=1),
+}
+```
+
+**posts/api_urls.py**
+```python
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+
+urlpatterns += [
+    path("auth/jwt/", TokenObtainPairView.as_view(), name="jwt-obtain"),
+    path("auth/jwt/refresh/", TokenRefreshView.as_view(), name="jwt-refresh"),
+]
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/auth/jwt/ \
+  -H "Content-Type: application/json" -d '{"username":"alice","password":"pass12345"}'
+# {"refresh": "...", "access": "..."}
+
+curl http://127.0.0.1:8000/api/posts/ -H "Authorization: Bearer <access>"
+```
+
+Note `Bearer`, not `Token`. Then paste the access token into a JWT decoder (jwt.io) and read the payload. You'll see it's only base64, **not encrypted**, so never put secrets in claims.
+
+Prove the "no lookup" claim: run a request under `CaptureQueriesContext` or `assertNumQueries` with a JWT versus a DRF token. Authenticating with the JWT skips the token-table query, though `JWTAuthentication` still loads the user row by default. Expect one fewer query, not zero.
+
+Gotchas specific to JWT:
+
+- **Every instance needs the same `SECRET_KEY`** (or the same signing key), or instance B rejects tokens issued by A. This is the stateless version of "same config everywhere".
+- **Tokens can't be revoked early.** Logout means the client discards the token, and the token itself stays valid until expiry. Keep access tokens short.
+- **Don't store tokens in places scripts can read** (like `localStorage`) for browser apps without thinking through XSS. For a pure API consumed by mobile or server clients, this matters less.
+- `rest_framework_simplejwt.token_blacklist` adds revocation, at the cost of a database table, as discussed above.
+
+## Part 4: Audit your own project
+
+For each item, write **stateless / stateful / unsure** and the fix. This is the core exercise of the day.
+
+| # | Item | Likely answer |
+|---|---|---|
+| 1 | SQLite database file | **Stateful.** A file on one machine. Move to PostgreSQL before running more than one app server |
+| 2 | `CACHES` on Redis (Day 15) | Stateless: shared across instances |
+| 3 | Tests and dev using `LocMemCache` | Stateful per process. Fine for tests, wrong for anything running multiple workers |
+| 4 | DRF throttling counters | Live in the cache, so **Redis = correct limits; LocMem = limit multiplied by worker count** |
+| 5 | Your Day 14 raw `redis.Redis` client | Shared state, fine, but it's a single Redis (a single point of failure) |
+| 6 | Token auth in the database | Stateless app tier, one DB lookup per request |
+| 7 | Celery beat | **Must run exactly once.** A deliberate singleton, so never bake it into every app instance |
+| 8 | `notified_at`, idempotency guards | Good: state is in the database, not in a worker |
+| 9 | Signal receivers and `post_published` | In-process, but each instance reacts to its own writes, which is fine. Invalidation goes through Redis, so it reaches everyone |
+| 10 | Any module-level dict or list you wrote | **Stateful.** Each process has its own copy |
+| 11 | `MEDIA_ROOT` (if you add avatars) | **Stateful.** Files on one disk. Use object storage |
+| 12 | `DEBUG = True`, `runserver` | Not a production server at all |
+| 13 | `DJANGO_SETTINGS`, `SECRET_KEY` hardcoded | Config drift. Read from environment variables |
+| 14 | `celerybeat-schedule` file | Local file state for beat, which is fine because beat is a singleton |
+
+## Part 5: See the bug yourself (30 min)
+
+A **module-level counter** is the classic mistake. Add a scratch view:
+
+```python
+# posts/views.py
+import os
+from django.core.cache import cache
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+HITS = 0                                  # per-process state: the bug
+
+class WhoAmIView(APIView):
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request):
+        global HITS
+        HITS += 1
+        return Response({
+            "pid": os.getpid(),
+            "local_hits": HITS,                       # differs per process
+            "shared_hits": cache.incr("hits") if cache.add("hits", 0, None) is False else 1,
+        })
+```
+
+The `shared_hits` line is clumsy. Write it clearly instead:
+
+```python
+cache.add("hits", 0, None)        # create if missing
+shared = cache.incr("hits")       # atomic, shared via Redis
+```
+
+Route it at `path("whoami/", WhoAmIView.as_view())` and run **multiple processes**:
+
+```bash
+pip install gunicorn
+gunicorn blog_platform.wsgi:application --workers 4 --bind 127.0.0.1:8001
+```
+
+```bash
+for i in $(seq 1 12); do curl -s http://127.0.0.1:8001/api/whoami/; echo; done
+```
+
+**Predict first.** You'll see 4 different `pid`s, `local_hits` climbing separately in each, and `shared_hits` counting 1 to 12 correctly. You've just reproduced why in-memory state breaks, on one machine, with no load balancer at all.
+
+Now add the load balancer. Run a second instance on port 8002, then put nginx in front:
+
+```nginx
+upstream django_app {
+    server 127.0.0.1:8001;
+    server 127.0.0.1:8002;        # round-robin by default
+}
+
+server {
+    listen 8080;
+    location / {
+        proxy_pass http://django_app;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+```
+
+Hit `http://127.0.0.1:8080/api/whoami/` repeatedly, and requests alternate between instances. Then check:
+
+1. **Log in with a JWT** on one request and use it on the next. It works whichever instance answers, because both share `SECRET_KEY`.
+2. **Change `SECRET_KEY`** for one instance and watch half your authenticated requests fail with 401. That's the "config must be identical" lesson.
+3. **Switch `CACHES` to LocMem** on both instances and repeat Day 16's invalidation test: edit a post, and one instance serves fresh data while the other serves stale. That's a real horizontal scaling bug.
+4. **Kill one instance** (Ctrl+C). nginx marks it failed and sends traffic to the survivor. That's the availability benefit.
+
+If you can't install nginx, Docker works (`docker run -p 8080:80 -v ...nginx.conf... nginx`), or skip it and just run the gunicorn multi-worker part, which already proves the principle.
+
+## Part 6: The database is the hard part
+
+App servers scale out easily because they're stateless. **The database holds the state**, so it's where horizontal scaling gets difficult. In the typical progression:
+
+1. **Vertical first**: more RAM and faster disks. This goes a long way, since most apps are nowhere near the limit.
+2. **Indexes and query tuning** (Days 4 and 5: `select_related`, `annotate`, `assertNumQueries`). The cheapest "scaling" is making queries cheaper.
+3. **Caching** (Days 15 and 16): take read load off the database.
+4. **Connection pooling** (PgBouncer): every app instance holds connections, and PostgreSQL has a connection limit. More app servers can exhaust it.
+5. **Read replicas**: writes go to a primary and reads to copies, which suits read-heavy apps like a blog. Replicas lag slightly, so a just-written row may not be readable there yet (**replication lag**).
+6. **Sharding or partitioning**: splitting data across databases. It's powerful and painful, and you'll rarely need it before enormous scale.
+
+Django supports routing reads and writes with `DATABASE_ROUTERS`. You don't need it yet. The point for today is **why** the database tier is treated differently.
+
+## Part 7: The reading
+
+For the ByteByteGo system design intro, search for it on YouTube (the ByteByteGo channel, for example "system design" or "scale from zero to millions of users"). I can't watch videos or confirm a specific link, so I won't guess a URL. While you watch, take notes on these questions:
+
+1. At which step does the video split the web tier from the data tier, and why?
+2. Where does it put the session or state, and how does that match Part 2's table?
+3. What role does the load balancer play, and what happens if it fails? (It becomes a new single point of failure, so it needs redundancy too.)
+4. What are caches, CDNs, and message queues each used for? Map each one to something you've already built.
+5. When does it recommend sharding, and what does it say about complexity?
+
+Then write a half-page answer: **"Which of those boxes does my blog already have, and which are missing?"** You'll find you already own a cache, a queue, workers, and a scheduler, and are missing a load balancer, a real database server, object storage, and a CDN.
+
+## Experiments (25 min)
+
+1. Run `gunicorn --workers 1` versus `--workers 4` and compare `ab -n 500 -c 20` throughput on an endpoint that does real work. Then try a different `--threads` setting. This is vertical scaling inside one machine.
+2. Confirm `local_hits` diverges across workers but `shared_hits` doesn't.
+3. Decode a JWT and edit one character of the payload. See the signature check fail with 401.
+4. Let an access token expire (set a 10-second lifetime) and use the refresh endpoint to get a new one.
+5. Count queries for an authenticated request with `Token` versus `Bearer`.
+6. Run two beat processes briefly and watch a task fire twice. That's the "singletons don't scale out" case.
+7. Try `SESSION_ENGINE = "django.contrib.sessions.backends.signed_cookies"` and note it's also stateless, with its own trade-offs (cookie size, and it can't be revoked).
+
+## Stretch goals
+
+- Write a one-page **scaling plan** for your blog at 10x, 100x, and 1000x traffic. For each stage, say what breaks first and what you'd do.
+- Add a `/api/health/` check (Day 19) and configure nginx to stop sending traffic to an instance that fails it.
+- Read about **sticky sessions**, then explain why they're a workaround for stateful apps and not a solution.
+- Research **blue-green** and **rolling** deploys, and note how statelessness makes them possible.
+- Calculate the cost of the largest single instance versus three medium ones on a cloud pricing page, and note the cost curve for vertical scaling.
+
+## Day 20 checklist
+
+- [ ] Can define vertical and horizontal scaling and give two trade-offs of each
+- [ ] Can explain what "stateless" means and list five kinds of state
+- [ ] Can explain precisely what JWT does and doesn't give you, including the revocation problem
+- [ ] Added JWT with `simplejwt` and tried `Bearer` auth
+- [ ] Reproduced the per-process counter bug with multiple gunicorn workers
+- [ ] Saw requests alternate across two instances, and survived killing one
+- [ ] Completed the 14-row project audit
+- [ ] Can explain why the database is harder to scale than the app tier
+- [ ] Watched the video and wrote the half-page answer
+
+## Common gotchas
+
+- **Scaling the app tier when the database is the bottleneck**: more servers means more connections and more load on the same DB. Measure first.
+- **Assuming JWT removes all state**: it moves it into the token. Revocation, key rotation, and refresh tokens bring state back.
+- **Different `SECRET_KEY` per instance**: every instance rejects the others' tokens (and sessions, and signed data).
+- **`LocMemCache` in a multi-process deployment**: stale invalidation, wrong throttle limits, and inconsistent reads.
+- **Running beat inside every instance**: duplicate scheduled work. It must be a singleton.
+- **Local `MEDIA_ROOT`**: an upload to instance A is invisible to B.
+- **Module-level mutable state**: lists, dicts, and counters that "work" in development with one process.
+- **Sticky sessions as a crutch**: they hide statefulness and break on failover and deploys.
+- **A load balancer as a new single point of failure**: production runs it redundantly.
+- **Premature horizontal scaling**: it adds real complexity. If one decent machine handles the load, scale up first.
+- **Ignoring connection limits**: N servers times M workers times pool size can exceed PostgreSQL's `max_connections`.
+- **Putting sensitive data in JWT claims**: the payload is readable by anyone holding the token.
+- **Believing scaling fixes slow queries**: ten servers running an N+1 query are ten times the N+1.
+
+Day 21 is typically a **load balancing and reverse proxy** day (nginx upstreams, health checks, and Docker Compose with multiple app containers), or an early introduction to **PostgreSQL in place of SQLite**, which Part 4's audit flagged as the first real blocker. Want that outline next?
