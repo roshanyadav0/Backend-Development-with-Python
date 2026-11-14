@@ -1,0 +1,749 @@
+# Day 21: Load Balancers
+
+Day 20 ended with nginx sending requests to two gunicorn instances. Today you look at what that box actually does, how it decides where to send traffic, and how it copes when an instance dies.
+
+## Part 1: What a load balancer does
+
+A load balancer (LB) sits in front of N identical servers and does four jobs:
+
+1. **Distributes** requests so no single instance is overloaded.
+2. **Detects failure** and stops sending traffic to dead instances (health checks).
+3. **Gives clients one address**, so you can add, remove, and replace instances without anyone noticing.
+4. **Often terminates TLS** and adds headers, compression, and rate limits.
+
+**Layer 4 vs layer 7:**
+
+| | L4 (transport) | L7 (application) |
+|---|---|---|
+| Sees | IPs and ports, TCP/UDP | HTTP: URL, headers, cookies |
+| Can route by | connection | path, host, header, cookie |
+| Cost | Very fast, simple | More CPU, much more flexible |
+| Examples | AWS NLB, HAProxy `mode tcp` | nginx, HAProxy `mode http`, AWS ALB |
+
+For a Django API you almost always want L7, because you need `/api/` routed one way and `/static/` another, and you want HTTP-aware health checks.
+
+The LB also becomes a **new single point of failure** (the Day 20 gotcha). Production runs two LBs, or uses a managed one that's redundant for you.
+
+## Part 2: Routing algorithms
+
+| Algorithm | How it picks | Good when | Weak when |
+|---|---|---|---|
+| **Round-robin** | 1, 2, 3, 1, 2, 3... | Requests cost about the same, instances are equal | One request type is much slower than another |
+| **Weighted round-robin** | Same, but `weight=3` gets 3x traffic | Mixed instance sizes, or canary releases (`weight=1` for the new version) | Weights need manual tuning |
+| **Least connections** | Instance with fewest active connections | Long or variable request times (uploads, slow queries) | Connection count is a rough proxy for load |
+| **IP hash** | `hash(client IP) % N` | Cheap "stickiness" | Uneven, and breaks when N changes |
+| **Consistent hash** | Hash of a key (user id, cookie) on a ring | Cache locality, minimal reshuffling when N changes | Uneven without virtual nodes |
+| **Random, two choices** | Pick 2 at random, take the less loaded | Surprisingly good at scale, avoids herding | Less intuitive |
+
+Why least-connections can beat round-robin: with round-robin, if every 3rd request is a 5-second report and the rest take 20 ms, one instance can end up with all the slow ones, queueing behind them while the others sit idle. Least-connections notices that instance has many open connections and routes around it.
+
+Your blog's traffic is mostly fast reads, so round-robin is fine. Try both in the experiments and see for yourself.
+
+## Part 3: A real setup with Docker Compose
+
+On Day 20 you hit the first blocker: SQLite is a file on one machine. Three containers can't safely share it, so today moves to PostgreSQL.
+
+```
+browser ─► nginx :8080 ─► app (x3 containers) ─► postgres
+                                  └──────────► redis
+```
+
+**requirements.txt** (add to what you have)
+```
+gunicorn
+psycopg[binary]
+dj-database-url
+```
+
+**Dockerfile**
+```dockerfile
+FROM python:3.12-slim
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD ["gunicorn", "blog_platform.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "2"]
+```
+
+**settings.py** changes (config from the environment, identical for every instance):
+```python
+import os
+import dj_database_url
+
+SECRET_KEY = os.environ["SECRET_KEY"]                  # same on every instance
+DEBUG = os.environ.get("DEBUG") == "1"
+ALLOWED_HOSTS = os.environ.get("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
+
+DATABASES = {"default": dj_database_url.config(default="sqlite:///db.sqlite3")}
+
+REDIS = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379")
+CACHES["default"]["LOCATION"] = f"{REDIS}/1"
+CELERY_BROKER_URL = f"{REDIS}/2"
+```
+
+**Identify which instance answered.** Add a tiny middleware so you can watch the balancing happen:
+
+```python
+# posts/middleware.py
+import socket
+
+HOSTNAME = socket.gethostname()      # the container id in Docker
+
+class ServedByMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        response = self.get_response(request)
+        response["X-Served-By"] = HOSTNAME
+        return response
+```
+
+Add `"posts.middleware.ServedByMiddleware"` to `MIDDLEWARE`.
+
+**Health endpoints.** Day 19's `HealthView` checked the DB, cache, and broker. A load balancer wants two different questions answered:
+
+| Endpoint | Question | Checks | Fails means |
+|---|---|---|---|
+| `/api/health/live/` | Is the process alive? | Nothing external | Restart it |
+| `/api/health/ready/` | Can it serve traffic now? | Database | Stop sending traffic |
+
+```python
+class LiveView(APIView):
+    authentication_classes, permission_classes, throttle_classes = [], [], []
+    def get(self, request):
+        return Response({"status": "alive"})
+
+class ReadyView(APIView):
+    authentication_classes, permission_classes, throttle_classes = [], [], []
+    def get(self, request):
+        try:
+            connection.ensure_connection()
+        except Exception:
+            return Response({"status": "db down"}, status=503)
+        return Response({"status": "ready"})
+```
+
+Keep Redis out of the readiness check on purpose. Your app degrades gracefully without the cache (Day 19), so pulling every instance out of rotation because Redis blipped would turn a slowdown into a total outage. A health check that's too strict causes outages.
+
+**docker-compose.yml**
+```yaml
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: devpass
+      POSTGRES_DB: blog
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+
+  app:
+    build: .
+    environment:
+      SECRET_KEY: dev-only-change-me
+      DATABASE_URL: postgres://postgres:devpass@db:5432/blog
+      REDIS_URL: redis://redis:6379
+      ALLOWED_HOSTS: "*"
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_started}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health/live/')"]
+      interval: 10s
+
+  nginx:
+    image: nginx:1.27
+    ports: ["8080:80"]
+    volumes: ["./nginx.conf:/etc/nginx/conf.d/default.conf:ro"]
+    depends_on: [app]
+```
+
+Run migrations once, then scale:
+
+```bash
+docker compose up -d db redis
+docker compose run --rm app python manage.py migrate
+docker compose up -d --scale app=3
+```
+
+Don't run `migrate` from every app container at startup, because three instances racing to migrate is a classic deploy bug. It's a one-off step in the deploy.
+
+**nginx.conf**
+```nginx
+upstream django_app {
+    # least_conn;                       # uncomment to compare with round-robin
+    server app:8000 max_fails=2 fail_timeout=10s;
+}
+
+server {
+    listen 80;
+
+    location / {
+        proxy_pass http://django_app;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 30s;
+        proxy_next_upstream error timeout http_502 http_503;
+    }
+}
+```
+
+Docker's DNS returns all three container IPs for `app`, and nginx round-robins across them. Caveat: nginx resolves that name **once at startup**, so if you scale up or containers get new IPs, run `docker compose exec nginx nginx -s reload`. (Real orchestrators handle this for you.)
+
+**Watch it work:**
+
+```bash
+for i in $(seq 1 12); do
+  curl -s -o /dev/null -D - http://127.0.0.1:8080/api/posts/ | grep -i x-served-by
+done | sort | uniq -c
+```
+
+Predict first: roughly 4 hits per container. Those are the three hostnames, and requests are spread evenly. That's round-robin.
+
+## Part 4: Health checks and failure
+
+There are two kinds, and the difference matters:
+
+| | Passive | Active |
+|---|---|---|
+| How | Watches real traffic; marks a server down after failures | LB probes `/health` every few seconds regardless of traffic |
+| Cost | Free, built into open-source nginx | Extra probe traffic |
+| Weakness | **Real users hit the dead server first** (the failed request is retried only if you allow it) | Probe can pass while real requests fail |
+| In nginx | `max_fails` and `fail_timeout` | **Plus only**, or third-party modules |
+| In HAProxy | available | built in and free |
+
+A correction to Day 20: when I said nginx "marks it failed and sends traffic to the survivor", that was the passive behavior. The first request or two to the dead instance may fail or be retried, and after `max_fails` it's skipped for `fail_timeout` seconds, then tried again.
+
+Open-source nginx has no active checks, so here's the same setup in HAProxy, where they're built in:
+
+```
+backend django_app
+    balance roundrobin                       # or: leastconn
+    option httpchk GET /api/health/ready/
+    http-check expect status 200
+    default-server inter 2s fall 3 rise 2
+    server s1 app1:8000 check
+    server s2 app2:8000 check
+    server s3 app3:8000 check
+```
+
+`inter 2s fall 3 rise 2` means probe every 2 seconds, mark down after 3 consecutive failures, and mark up after 2 consecutive successes. The `rise` threshold prevents flapping: without it, an instance that's half-working bounces in and out of rotation.
+
+**Retries have a trap.** `proxy_next_upstream` retries a failed request on another server. By default nginx does **not** retry non-idempotent requests (POST, PATCH) once they've been sent, because a retry could create two posts or comments. Your Celery tasks are idempotent by design (Day 18), but your POST endpoints aren't, so leave that default alone unless you add idempotency keys.
+
+**Graceful shutdown:** when you deploy, an instance should finish in-flight requests and fail its readiness check first, so the LB drains it before it dies. This is how rolling deploys achieve zero downtime. Gunicorn does the finishing part on `SIGTERM`.
+
+## Part 5: Sticky sessions
+
+**What they are:** the LB sends the same client to the same instance every time, using a cookie (best), or the client's IP hash.
+
+```
+user A ─► always app1       user B ─► always app3
+```
+
+**Why people reach for them:** the app keeps state in memory (login sessions, a shopping cart, an upload in progress), so the user has to return to the instance that holds it.
+
+**Why they hurt horizontal scaling:**
+
+| Problem | What happens |
+|---|---|
+| **Uneven load** | Heavy users pile onto one instance; round-robin can't rebalance them |
+| **Failover loses state** | The instance dies, and so do its sessions: users are logged out mid-action |
+| **Deploys hurt** | Restarting an instance evicts every user stuck to it |
+| **Scaling out doesn't help** | A new instance gets only new clients; existing ones stay put on the overloaded one |
+| **Scaling in is destructive** | Removing an instance destroys state |
+| **Hides the real bug** | The app isn't stateless, and stickiness just conceals it until the day it matters |
+
+`ip_hash` is the crudest version, and has its own failure: everyone behind one corporate NAT, or behind another proxy or CDN, shares an IP and lands on one server.
+
+Your project doesn't need stickiness. Tokens live in the database, the cache is in Redis, and tasks use IDs, so any instance can serve any request. That was Day 20's whole point.
+
+**When stickiness is legitimate:** WebSocket or long-poll connections (the connection itself is pinned anyway), a legacy app you can't change yet, or an in-memory cache you want to stay warm per user (an optimization, never a correctness requirement).
+
+Try it for contrast:
+
+```nginx
+upstream django_app {
+    ip_hash;
+    server app:8000;
+}
+```
+
+Because of Docker's networking, you'll often see **all** your requests go to one container, since they all arrive from the same source IP. That unevenness is the failure mode, observed. Remove `ip_hash` afterward.
+
+## Part 6: Don't forget what the LB hides from Django
+
+Behind a proxy, every request arrives from the LB's IP. Three things break quietly:
+
+1. **`request.META["REMOTE_ADDR"]` is the LB's address.** DRF's `AnonRateThrottle` keys on client IP, so **all users share one throttle bucket**, and one burst can lock everyone out. Fix with DRF's `NUM_PROXIES`:
+   ```python
+   REST_FRAMEWORK["NUM_PROXIES"] = 1     # number of trusted proxies in front of Django
+   ```
+   Set it to the real count. If it's too high, clients can spoof `X-Forwarded-For` and dodge limits.
+2. **HTTPS detection.** If nginx terminates TLS, Django sees plain HTTP. Add `SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")`, but only when the LB always overwrites that header, or clients can fake it.
+3. **`ALLOWED_HOSTS` and `Host`.** Pass the original host through (`proxy_set_header Host $host`), or Django rejects requests with 400.
+
+## Part 7: Draw it (from memory first)
+
+```
+                        ┌──────────────────────────────────────────┐
+ Browser ──HTTPS──►     │  Load balancer (nginx/HAProxy)           │
+                        │  • TLS termination                       │
+                        │  • algorithm: round-robin / least_conn   │
+                        │  • health checks: /api/health/ready/     │
+                        └───────┬──────────────┬───────────┬───────┘
+                                │              │           │
+                                ▼              ▼           ▼
+                           ┌────────┐     ┌────────┐  ┌────────┐
+                           │ app 1  │     │ app 2  │  │ app 3  │   stateless,
+                           │gunicorn│     │gunicorn│  │gunicorn│   identical config
+                           └───┬────┘     └───┬────┘  └───┬────┘
+                               └──────────────┼───────────┘
+                          ┌───────────────────┼──────────────────┐
+                          ▼                   ▼                  ▼
+                   ┌────────────┐      ┌────────────┐     ┌─────────────┐
+                   │ PostgreSQL │      │ Redis      │     │ Celery      │
+                   │ (truth)    │      │ cache/queue│     │ workers+beat│
+                   └────────────┘      └────────────┘     └─────────────┘
+```
+
+Annotate your drawing with three things: what happens if app 2 dies, what happens if the LB dies, and what happens if Postgres dies. (Answers: the LB stops sending traffic to it after failed checks; the whole site is unreachable unless there's a second LB; the whole write path is down, and the cache only covers some reads, which is why the database is the next thing to make redundant.)
+
+## Experiments (30 min)
+
+1. Run the 12-request loop and count `X-Served-By` values. Then switch to `least_conn;`, reload nginx, and repeat.
+2. **Make requests unequal.** Add a `/api/slow/` view that sleeps 2 seconds. Fire 20 concurrent requests at it with `ab -n 40 -c 20`, then compare how evenly the instances are loaded under round-robin vs `least_conn` (watch `docker stats` or per-instance logs).
+3. **Kill an instance:** `docker kill <one app container>` while looping curl. Count the failed requests before nginx stops using it. Then `docker compose up -d --scale app=3` to recover.
+4. Set `max_fails=1 fail_timeout=30s`, kill an instance, and see how long the dead one stays out.
+5. Make `ReadyView` return 503 on one instance (e.g. an env var flag) and confirm HAProxy removes it while the process stays alive. Passive nginx wouldn't notice, since real requests still... fail only if the app itself errors, so compare.
+6. Turn on `ip_hash` and watch the traffic concentrate on one container.
+7. Check throttling before and after `NUM_PROXIES`: log `request.META["REMOTE_ADDR"]` versus the value DRF computes.
+8. Run `docker compose up -d --scale app=1`, then `--scale app=5` without reloading nginx, and see which new instances receive traffic.
+9. Stop Redis, and confirm the site stays up and `/ready/` still passes (by design).
+10. Weight a canary: `server app2:8000 weight=1; server app1:8000 weight=9;` and check the roughly 90/10 split over 100 requests.
+
+## Stretch goals
+
+- Write a `hit_counts.py` script that fires 300 requests and prints the distribution per instance, so you can compare algorithms numerically.
+- Add a second LB with a floating IP concept on paper (keepalived/VRRP), and say what it protects against.
+- Add a rolling deploy: scale to 6, stop the 3 old containers, and check zero failed requests with a looping curl.
+- Terminate TLS in nginx with a self-signed certificate and set `SECURE_PROXY_SSL_HEADER`.
+- Put `/static/` behind nginx directly (no Django hit) and compare with serving it through the app.
+- Read about connection draining, and how `slow_start` (Plus) helps cold instances.
+
+## Day 21 checklist
+
+- [ ] Can explain what a load balancer does and the L4 vs L7 difference
+- [ ] Can say when least-connections beats round-robin, with an example
+- [ ] Compose stack running: nginx, 3 app containers, Postgres, Redis
+- [ ] Saw `X-Served-By` spread across three instances
+- [ ] Split liveness and readiness, and can justify keeping Redis out of readiness
+- [ ] Killed an instance and observed the failover behavior
+- [ ] Can contrast passive vs active health checks and name nginx's limitation
+- [ ] Can give four reasons sticky sessions hurt scaling, and two legitimate uses
+- [ ] Set `NUM_PROXIES` and understand the spoofing risk
+- [ ] Drew the browser → LB → 3 apps → shared DB diagram and annotated three failures
+
+## Common gotchas
+
+- **All users share one throttle bucket**: Django sees the LB's IP. Set `NUM_PROXIES` correctly.
+- **Too-strict readiness check**: failing it because Redis is down removes every instance and turns degradation into an outage.
+- **Too-lenient liveness check**: a hung app still answers "alive". Make sure the check exercises the app's request path.
+- **Health check hits an authenticated or throttled route**: it fails for the wrong reason. Use a dedicated, open endpoint.
+- **nginx caches DNS at startup**: new or replaced containers aren't picked up until reload (or a `resolver` plus variable setup).
+- **Open-source nginx has no active checks**: don't assume it probes. Use HAProxy, a managed LB, or nginx Plus.
+- **Retrying POSTs**: it can create duplicates. Keep the default, or add idempotency keys.
+- **Running `migrate` in every container's startup**: races between instances. Run it once per deploy.
+- **Different `SECRET_KEY` or settings per instance**: random 401s and inconsistent behavior (Day 20).
+- **SQLite behind multiple containers**: file locking errors and data corruption risk. Use Postgres.
+- **Flapping**: with no `rise` threshold, a borderline instance bounces in and out of rotation.
+- **No timeouts on the proxy**: a hung instance holds connections open and ties up the LB.
+- **LB as the single point of failure**: redundant LBs, or a managed one.
+- **Sticky sessions used to hide statefulness**: fix the state, not the routing.
+- **Trusting `X-Forwarded-For` blindly**: only trust it from your own proxy, and make the proxy overwrite client-supplied values.
+- **Balancing across unequal instances evenly**: use weights, or least-connections.
+
+Day 22 is typically **database scaling**: PostgreSQL indexes and `EXPLAIN ANALYZE`, connection pooling with PgBouncer, and read replicas with Django's `DATABASE_ROUTERS`. Day 20's audit flagged the database as the hard tier. Want that outline next?# Day 21: Load Balancers
+
+Day 20 ended with nginx sending requests to two gunicorn instances. Today you look at what that box actually does, how it decides where to send traffic, and how it copes when an instance dies.
+
+## Part 1: What a load balancer does
+
+A load balancer (LB) sits in front of N identical servers and does four jobs:
+
+1. **Distributes** requests so no single instance is overloaded.
+2. **Detects failure** and stops sending traffic to dead instances (health checks).
+3. **Gives clients one address**, so you can add, remove, and replace instances without anyone noticing.
+4. **Often terminates TLS** and adds headers, compression, and rate limits.
+
+**Layer 4 vs layer 7:**
+
+| | L4 (transport) | L7 (application) |
+|---|---|---|
+| Sees | IPs and ports, TCP/UDP | HTTP: URL, headers, cookies |
+| Can route by | connection | path, host, header, cookie |
+| Cost | Very fast, simple | More CPU, much more flexible |
+| Examples | AWS NLB, HAProxy `mode tcp` | nginx, HAProxy `mode http`, AWS ALB |
+
+For a Django API you almost always want L7, because you need `/api/` routed one way and `/static/` another, and you want HTTP-aware health checks.
+
+The LB also becomes a **new single point of failure** (the Day 20 gotcha). Production runs two LBs, or uses a managed one that's redundant for you.
+
+## Part 2: Routing algorithms
+
+| Algorithm | How it picks | Good when | Weak when |
+|---|---|---|---|
+| **Round-robin** | 1, 2, 3, 1, 2, 3... | Requests cost about the same, instances are equal | One request type is much slower than another |
+| **Weighted round-robin** | Same, but `weight=3` gets 3x traffic | Mixed instance sizes, or canary releases (`weight=1` for the new version) | Weights need manual tuning |
+| **Least connections** | Instance with fewest active connections | Long or variable request times (uploads, slow queries) | Connection count is a rough proxy for load |
+| **IP hash** | `hash(client IP) % N` | Cheap "stickiness" | Uneven, and breaks when N changes |
+| **Consistent hash** | Hash of a key (user id, cookie) on a ring | Cache locality, minimal reshuffling when N changes | Uneven without virtual nodes |
+| **Random, two choices** | Pick 2 at random, take the less loaded | Surprisingly good at scale, avoids herding | Less intuitive |
+
+Why least-connections can beat round-robin: with round-robin, if every 3rd request is a 5-second report and the rest take 20 ms, one instance can end up with all the slow ones, queueing behind them while the others sit idle. Least-connections notices that instance has many open connections and routes around it.
+
+Your blog's traffic is mostly fast reads, so round-robin is fine. Try both in the experiments and see for yourself.
+
+## Part 3: A real setup with Docker Compose
+
+On Day 20 you hit the first blocker: SQLite is a file on one machine. Three containers can't safely share it, so today moves to PostgreSQL.
+
+```
+browser ─► nginx :8080 ─► app (x3 containers) ─► postgres
+                                  └──────────► redis
+```
+
+**requirements.txt** (add to what you have)
+```
+gunicorn
+psycopg[binary]
+dj-database-url
+```
+
+**Dockerfile**
+```dockerfile
+FROM python:3.12-slim
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD ["gunicorn", "blog_platform.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "2"]
+```
+
+**settings.py** changes (config from the environment, identical for every instance):
+```python
+import os
+import dj_database_url
+
+SECRET_KEY = os.environ["SECRET_KEY"]                  # same on every instance
+DEBUG = os.environ.get("DEBUG") == "1"
+ALLOWED_HOSTS = os.environ.get("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
+
+DATABASES = {"default": dj_database_url.config(default="sqlite:///db.sqlite3")}
+
+REDIS = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379")
+CACHES["default"]["LOCATION"] = f"{REDIS}/1"
+CELERY_BROKER_URL = f"{REDIS}/2"
+```
+
+**Identify which instance answered.** Add a tiny middleware so you can watch the balancing happen:
+
+```python
+# posts/middleware.py
+import socket
+
+HOSTNAME = socket.gethostname()      # the container id in Docker
+
+class ServedByMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        response = self.get_response(request)
+        response["X-Served-By"] = HOSTNAME
+        return response
+```
+
+Add `"posts.middleware.ServedByMiddleware"` to `MIDDLEWARE`.
+
+**Health endpoints.** Day 19's `HealthView` checked the DB, cache, and broker. A load balancer wants two different questions answered:
+
+| Endpoint | Question | Checks | Fails means |
+|---|---|---|---|
+| `/api/health/live/` | Is the process alive? | Nothing external | Restart it |
+| `/api/health/ready/` | Can it serve traffic now? | Database | Stop sending traffic |
+
+```python
+class LiveView(APIView):
+    authentication_classes, permission_classes, throttle_classes = [], [], []
+    def get(self, request):
+        return Response({"status": "alive"})
+
+class ReadyView(APIView):
+    authentication_classes, permission_classes, throttle_classes = [], [], []
+    def get(self, request):
+        try:
+            connection.ensure_connection()
+        except Exception:
+            return Response({"status": "db down"}, status=503)
+        return Response({"status": "ready"})
+```
+
+Keep Redis out of the readiness check on purpose. Your app degrades gracefully without the cache (Day 19), so pulling every instance out of rotation because Redis blipped would turn a slowdown into a total outage. A health check that's too strict causes outages.
+
+**docker-compose.yml**
+```yaml
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: devpass
+      POSTGRES_DB: blog
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+
+  app:
+    build: .
+    environment:
+      SECRET_KEY: dev-only-change-me
+      DATABASE_URL: postgres://postgres:devpass@db:5432/blog
+      REDIS_URL: redis://redis:6379
+      ALLOWED_HOSTS: "*"
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_started}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health/live/')"]
+      interval: 10s
+
+  nginx:
+    image: nginx:1.27
+    ports: ["8080:80"]
+    volumes: ["./nginx.conf:/etc/nginx/conf.d/default.conf:ro"]
+    depends_on: [app]
+```
+
+Run migrations once, then scale:
+
+```bash
+docker compose up -d db redis
+docker compose run --rm app python manage.py migrate
+docker compose up -d --scale app=3
+```
+
+Don't run `migrate` from every app container at startup, because three instances racing to migrate is a classic deploy bug. It's a one-off step in the deploy.
+
+**nginx.conf**
+```nginx
+upstream django_app {
+    # least_conn;                       # uncomment to compare with round-robin
+    server app:8000 max_fails=2 fail_timeout=10s;
+}
+
+server {
+    listen 80;
+
+    location / {
+        proxy_pass http://django_app;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 30s;
+        proxy_next_upstream error timeout http_502 http_503;
+    }
+}
+```
+
+Docker's DNS returns all three container IPs for `app`, and nginx round-robins across them. Caveat: nginx resolves that name **once at startup**, so if you scale up or containers get new IPs, run `docker compose exec nginx nginx -s reload`. (Real orchestrators handle this for you.)
+
+**Watch it work:**
+
+```bash
+for i in $(seq 1 12); do
+  curl -s -o /dev/null -D - http://127.0.0.1:8080/api/posts/ | grep -i x-served-by
+done | sort | uniq -c
+```
+
+Predict first: roughly 4 hits per container. Those are the three hostnames, and requests are spread evenly. That's round-robin.
+
+## Part 4: Health checks and failure
+
+There are two kinds, and the difference matters:
+
+| | Passive | Active |
+|---|---|---|
+| How | Watches real traffic; marks a server down after failures | LB probes `/health` every few seconds regardless of traffic |
+| Cost | Free, built into open-source nginx | Extra probe traffic |
+| Weakness | **Real users hit the dead server first** (the failed request is retried only if you allow it) | Probe can pass while real requests fail |
+| In nginx | `max_fails` and `fail_timeout` | **Plus only**, or third-party modules |
+| In HAProxy | available | built in and free |
+
+A correction to Day 20: when I said nginx "marks it failed and sends traffic to the survivor", that was the passive behavior. The first request or two to the dead instance may fail or be retried, and after `max_fails` it's skipped for `fail_timeout` seconds, then tried again.
+
+Open-source nginx has no active checks, so here's the same setup in HAProxy, where they're built in:
+
+```
+backend django_app
+    balance roundrobin                       # or: leastconn
+    option httpchk GET /api/health/ready/
+    http-check expect status 200
+    default-server inter 2s fall 3 rise 2
+    server s1 app1:8000 check
+    server s2 app2:8000 check
+    server s3 app3:8000 check
+```
+
+`inter 2s fall 3 rise 2` means probe every 2 seconds, mark down after 3 consecutive failures, and mark up after 2 consecutive successes. The `rise` threshold prevents flapping: without it, an instance that's half-working bounces in and out of rotation.
+
+**Retries have a trap.** `proxy_next_upstream` retries a failed request on another server. By default nginx does **not** retry non-idempotent requests (POST, PATCH) once they've been sent, because a retry could create two posts or comments. Your Celery tasks are idempotent by design (Day 18), but your POST endpoints aren't, so leave that default alone unless you add idempotency keys.
+
+**Graceful shutdown:** when you deploy, an instance should finish in-flight requests and fail its readiness check first, so the LB drains it before it dies. This is how rolling deploys achieve zero downtime. Gunicorn does the finishing part on `SIGTERM`.
+
+## Part 5: Sticky sessions
+
+**What they are:** the LB sends the same client to the same instance every time, using a cookie (best), or the client's IP hash.
+
+```
+user A ─► always app1       user B ─► always app3
+```
+
+**Why people reach for them:** the app keeps state in memory (login sessions, a shopping cart, an upload in progress), so the user has to return to the instance that holds it.
+
+**Why they hurt horizontal scaling:**
+
+| Problem | What happens |
+|---|---|
+| **Uneven load** | Heavy users pile onto one instance; round-robin can't rebalance them |
+| **Failover loses state** | The instance dies, and so do its sessions: users are logged out mid-action |
+| **Deploys hurt** | Restarting an instance evicts every user stuck to it |
+| **Scaling out doesn't help** | A new instance gets only new clients; existing ones stay put on the overloaded one |
+| **Scaling in is destructive** | Removing an instance destroys state |
+| **Hides the real bug** | The app isn't stateless, and stickiness just conceals it until the day it matters |
+
+`ip_hash` is the crudest version, and has its own failure: everyone behind one corporate NAT, or behind another proxy or CDN, shares an IP and lands on one server.
+
+Your project doesn't need stickiness. Tokens live in the database, the cache is in Redis, and tasks use IDs, so any instance can serve any request. That was Day 20's whole point.
+
+**When stickiness is legitimate:** WebSocket or long-poll connections (the connection itself is pinned anyway), a legacy app you can't change yet, or an in-memory cache you want to stay warm per user (an optimization, never a correctness requirement).
+
+Try it for contrast:
+
+```nginx
+upstream django_app {
+    ip_hash;
+    server app:8000;
+}
+```
+
+Because of Docker's networking, you'll often see **all** your requests go to one container, since they all arrive from the same source IP. That unevenness is the failure mode, observed. Remove `ip_hash` afterward.
+
+## Part 6: Don't forget what the LB hides from Django
+
+Behind a proxy, every request arrives from the LB's IP. Three things break quietly:
+
+1. **`request.META["REMOTE_ADDR"]` is the LB's address.** DRF's `AnonRateThrottle` keys on client IP, so **all users share one throttle bucket**, and one burst can lock everyone out. Fix with DRF's `NUM_PROXIES`:
+   ```python
+   REST_FRAMEWORK["NUM_PROXIES"] = 1     # number of trusted proxies in front of Django
+   ```
+   Set it to the real count. If it's too high, clients can spoof `X-Forwarded-For` and dodge limits.
+2. **HTTPS detection.** If nginx terminates TLS, Django sees plain HTTP. Add `SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")`, but only when the LB always overwrites that header, or clients can fake it.
+3. **`ALLOWED_HOSTS` and `Host`.** Pass the original host through (`proxy_set_header Host $host`), or Django rejects requests with 400.
+
+## Part 7: Draw it (from memory first)
+
+```
+                        ┌──────────────────────────────────────────┐
+ Browser ──HTTPS──►     │  Load balancer (nginx/HAProxy)           │
+                        │  • TLS termination                       │
+                        │  • algorithm: round-robin / least_conn   │
+                        │  • health checks: /api/health/ready/     │
+                        └───────┬──────────────┬───────────┬───────┘
+                                │              │           │
+                                ▼              ▼           ▼
+                           ┌────────┐     ┌────────┐  ┌────────┐
+                           │ app 1  │     │ app 2  │  │ app 3  │   stateless,
+                           │gunicorn│     │gunicorn│  │gunicorn│   identical config
+                           └───┬────┘     └───┬────┘  └───┬────┘
+                               └──────────────┼───────────┘
+                          ┌───────────────────┼──────────────────┐
+                          ▼                   ▼                  ▼
+                   ┌────────────┐      ┌────────────┐     ┌─────────────┐
+                   │ PostgreSQL │      │ Redis      │     │ Celery      │
+                   │ (truth)    │      │ cache/queue│     │ workers+beat│
+                   └────────────┘      └────────────┘     └─────────────┘
+```
+
+Annotate your drawing with three things: what happens if app 2 dies, what happens if the LB dies, and what happens if Postgres dies. (Answers: the LB stops sending traffic to it after failed checks; the whole site is unreachable unless there's a second LB; the whole write path is down, and the cache only covers some reads, which is why the database is the next thing to make redundant.)
+
+## Experiments (30 min)
+
+1. Run the 12-request loop and count `X-Served-By` values. Then switch to `least_conn;`, reload nginx, and repeat.
+2. **Make requests unequal.** Add a `/api/slow/` view that sleeps 2 seconds. Fire 20 concurrent requests at it with `ab -n 40 -c 20`, then compare how evenly the instances are loaded under round-robin vs `least_conn` (watch `docker stats` or per-instance logs).
+3. **Kill an instance:** `docker kill <one app container>` while looping curl. Count the failed requests before nginx stops using it. Then `docker compose up -d --scale app=3` to recover.
+4. Set `max_fails=1 fail_timeout=30s`, kill an instance, and see how long the dead one stays out.
+5. Make `ReadyView` return 503 on one instance (e.g. an env var flag) and confirm HAProxy removes it while the process stays alive. Passive nginx wouldn't notice, since real requests still... fail only if the app itself errors, so compare.
+6. Turn on `ip_hash` and watch the traffic concentrate on one container.
+7. Check throttling before and after `NUM_PROXIES`: log `request.META["REMOTE_ADDR"]` versus the value DRF computes.
+8. Run `docker compose up -d --scale app=1`, then `--scale app=5` without reloading nginx, and see which new instances receive traffic.
+9. Stop Redis, and confirm the site stays up and `/ready/` still passes (by design).
+10. Weight a canary: `server app2:8000 weight=1; server app1:8000 weight=9;` and check the roughly 90/10 split over 100 requests.
+
+## Stretch goals
+
+- Write a `hit_counts.py` script that fires 300 requests and prints the distribution per instance, so you can compare algorithms numerically.
+- Add a second LB with a floating IP concept on paper (keepalived/VRRP), and say what it protects against.
+- Add a rolling deploy: scale to 6, stop the 3 old containers, and check zero failed requests with a looping curl.
+- Terminate TLS in nginx with a self-signed certificate and set `SECURE_PROXY_SSL_HEADER`.
+- Put `/static/` behind nginx directly (no Django hit) and compare with serving it through the app.
+- Read about connection draining, and how `slow_start` (Plus) helps cold instances.
+
+## Day 21 checklist
+
+- [ ] Can explain what a load balancer does and the L4 vs L7 difference
+- [ ] Can say when least-connections beats round-robin, with an example
+- [ ] Compose stack running: nginx, 3 app containers, Postgres, Redis
+- [ ] Saw `X-Served-By` spread across three instances
+- [ ] Split liveness and readiness, and can justify keeping Redis out of readiness
+- [ ] Killed an instance and observed the failover behavior
+- [ ] Can contrast passive vs active health checks and name nginx's limitation
+- [ ] Can give four reasons sticky sessions hurt scaling, and two legitimate uses
+- [ ] Set `NUM_PROXIES` and understand the spoofing risk
+- [ ] Drew the browser → LB → 3 apps → shared DB diagram and annotated three failures
+
+## Common gotchas
+
+- **All users share one throttle bucket**: Django sees the LB's IP. Set `NUM_PROXIES` correctly.
+- **Too-strict readiness check**: failing it because Redis is down removes every instance and turns degradation into an outage.
+- **Too-lenient liveness check**: a hung app still answers "alive". Make sure the check exercises the app's request path.
+- **Health check hits an authenticated or throttled route**: it fails for the wrong reason. Use a dedicated, open endpoint.
+- **nginx caches DNS at startup**: new or replaced containers aren't picked up until reload (or a `resolver` plus variable setup).
+- **Open-source nginx has no active checks**: don't assume it probes. Use HAProxy, a managed LB, or nginx Plus.
+- **Retrying POSTs**: it can create duplicates. Keep the default, or add idempotency keys.
+- **Running `migrate` in every container's startup**: races between instances. Run it once per deploy.
+- **Different `SECRET_KEY` or settings per instance**: random 401s and inconsistent behavior (Day 20).
+- **SQLite behind multiple containers**: file locking errors and data corruption risk. Use Postgres.
+- **Flapping**: with no `rise` threshold, a borderline instance bounces in and out of rotation.
+- **No timeouts on the proxy**: a hung instance holds connections open and ties up the LB.
+- **LB as the single point of failure**: redundant LBs, or a managed one.
+- **Sticky sessions used to hide statefulness**: fix the state, not the routing.
+- **Trusting `X-Forwarded-For` blindly**: only trust it from your own proxy, and make the proxy overwrite client-supplied values.
+- **Balancing across unequal instances evenly**: use weights, or least-connections.
+
+Day 22 is typically **database scaling**: PostgreSQL indexes and `EXPLAIN ANALYZE`, connection pooling with PgBouncer, and read replicas with Django's `DATABASE_ROUTERS`. Day 20's audit flagged the database as the hard tier. Want that outline next?
