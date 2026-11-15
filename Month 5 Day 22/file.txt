@@ -1,0 +1,341 @@
+# Day 22: Monolith vs Microservices
+
+Day 20 asked "can this app run as N copies?" Today asks a different question: **should the app be one deployable thing or many?** These are separate decisions. Your blog already runs as several processes (web, worker, beat) and could run as three web copies behind nginx, and it is still one monolith.
+
+## Part 0: A garbled line in Day 21
+
+Experiment 5 on Day 21 trailed off mid-sentence. The point was:
+
+- **Passive checks** (open-source nginx) only react to real request failures. If an instance's `/ready/` returns 503 but it still serves normal requests fine, nginx never notices.
+- **Active checks** (HAProxy) probe `/ready/` themselves and pull that instance from rotation.
+
+If your results differed, trust what you observed and note why.
+
+## Part 1: Definitions
+
+| Term | Meaning | Your blog |
+|---|---|---|
+| **Monolith** | One codebase, built and deployed as one unit, usually one database | ✅ Today |
+| **Modular monolith** | A monolith with enforced internal boundaries between domains | The goal for today |
+| **Microservices** | Many small services, each **independently deployable**, owning its own data, talking over the network | Not you |
+| **Distributed monolith** | Many services that must be deployed together and share a database | The failure mode to avoid |
+
+A common misunderstanding: "monolith" doesn't mean messy or single-process. Gunicorn workers, Celery workers, and beat all run **the same codebase**, so it's still one monolith with several process types. The test is whether you can **deploy one part without redeploying the rest**. Today you can't, because everything ships in one image.
+
+## Part 2: The trade-offs
+
+| | Monolith | Microservices |
+|---|---|---|
+| **Build speed early** | Fast: one repo, one deploy, one DB | Slow: infrastructure before features |
+| **Calls between parts** | Function call: nanoseconds, can't fail | Network call: milliseconds, can time out |
+| **Transactions** | One DB transaction, ACID | No cross-service transaction; sagas, outbox, eventual consistency |
+| **Refactoring boundaries** | Move code, run tests | Change APIs, coordinate versions and deploys |
+| **Scaling** | Whole app scales together (inefficient if one part is hot) | Scale each service by its own load |
+| **Deploy** | All or nothing; one bad change can take everything down | Small independent deploys, but many pipelines |
+| **Fault isolation** | A memory leak in one module hurts all | One service can fail while others degrade gracefully |
+| **Tech choices** | One stack | Each service picks its own (a cost as often as a benefit) |
+| **Debugging** | One stack trace | Requests span services; you need distributed tracing |
+| **Local dev and testing** | `runserver` | Run or fake a dozen services |
+| **Team scaling** | Merge conflicts and deploy contention as the team grows | Teams own services and move independently |
+
+The last row is the real driver. **Microservices mostly solve an organizational scaling problem** (many teams stepping on each other) rather than a technical one. A monolith on a big machine, with replicas, a cache, and a queue, handles a large amount of traffic. Many successful companies ran monoliths at very large scale.
+
+## Part 3: What the network boundary costs
+
+Take "list posts with author names". In your monolith:
+
+```python
+Post.objects.select_related("author")[:10]       # one JOIN, one query, can't time out
+```
+
+Now imagine users live in a separate service:
+
+```python
+import requests
+
+USER_SERVICE = "http://localhost:9000"
+
+def author_name(user_id):
+    r = requests.get(f"{USER_SERVICE}/users/{user_id}", timeout=0.5)
+    r.raise_for_status()
+    return r.json()["username"]
+
+def list_posts():
+    posts = list(Post.objects.all()[:10])
+    return [{"title": p.title, "author": author_name(p.author_id)} for p in posts]
+```
+
+That's your Day 4 N+1 problem again, now over the network: 10 posts means 10 HTTP calls. Fixing it needs a batch endpoint (`/users?ids=1,2,3`). That means more API surface to design, version, and keep compatible.
+
+Costs that come with the boundary:
+
+- **Latency adds up.** Each hop costs milliseconds, and serial calls stack.
+- **Availability multiplies.** Three services in a chain, each 99.9% available, give about 99.7% combined (0.999³). More synchronous dependencies means less uptime.
+- **No shared transaction.** Today's "save comment, then notify on commit" is one database transaction plus `on_commit`. Across services you need the outbox pattern (Day 18 stretch) or a saga.
+- **Data consistency.** If `Post.author_id` points at a user in another service's database, there is no foreign key. Deleting a user can leave dangling ids.
+- **Partial failure.** "The user service is down" is a new state your code must handle: timeouts, retries, circuit breakers, fallbacks.
+- **Observability.** You need correlation ids, centralized logs, and tracing to follow one request across services.
+- **Operations.** Each service needs its own pipeline, config, health checks, alerts, and on-call ownership.
+
+Martin Fowler calls this the **microservice premium**: a fixed tax that only pays off once the system is complex enough.
+
+## Part 4: Why "monolith first"
+
+1. **You don't know the boundaries yet.** Early on, requirements shift weekly. Moving code between modules in one repo is cheap. Moving responsibilities between services means changing contracts, data stores, and deploys. Wrong boundaries are expensive to fix.
+2. **Speed to learn matters most early.** Until you know people want the product, architecture investment is a bet.
+3. **You can't afford the premium** with a small team.
+4. **Extraction is easier than merging.** A well-factored monolith can be split along seams that real usage has revealed. A premature microservice system rarely merges back cleanly.
+5. **Conway's law:** systems tend to mirror the communication structure of the organization that builds them. With one team, one deployable unit fits naturally.
+
+The honest caveat: this is a widely held heuristic based on experience, not a theorem. There are real cases for starting with services (a team that already has the platform tooling, hard compliance isolation, wildly different workloads from day one). Fowler himself presents it as a hypothesis from limited anecdotes, and there are published counter-arguments. Find one and read it in Part 8.
+
+## Part 5: When would you split the Blog Platform?
+
+Good reasons, each tied to something concrete:
+
+| Signal | Example in your blog | Typical move |
+|---|---|---|
+| **Different scaling profile** | Image processing or email volume dwarfs everything else | Separate worker pool (you already have Celery) |
+| **Different technology needs** | Real search (OpenSearch), recommendations with heavy ML libraries, WebSocket live comments | Extract that capability |
+| **Team contention** | Several teams blocking each other on one deploy pipeline | Split along team ownership |
+| **Fault isolation** | A comment spam storm shouldn't take down reading | Separate the failure domain |
+| **Different release cadence** | Notifications change daily; billing changes quarterly | Independent deploys |
+| **Security or compliance isolation** | Payments or sensitive PII needs a smaller attack surface | Isolate and lock down |
+
+Bad reasons: "it's modern", "the code is messy" (modularize it instead), "queries are slow" (indexes and caching, Days 4 and 15), "it would look good on my CV", or "Netflix does it".
+
+**If you did extract, in what order?** Rank candidates by how cleanly they separate:
+
+| Candidate | Difficulty | Why |
+|---|---|---|
+| **Notifications** (email, push) | Easiest | Already async (Day 18). Fire-and-forget, tolerates delay, needs only a few ids. Nothing waits for its answer |
+| **Search** | Easy-medium | A read-only copy of data, rebuilt from events; no writes flow back |
+| **Media processing** | Easy-medium | Heavy CPU, different scaling, well-defined input and output |
+| **Public read API behind a CDN** | Medium | Mostly caching and read replicas, so a deployment concern more than a service split |
+| **Posts + comments + likes** | Hard, keep together | Tightly coupled, transactional, constantly queried together |
+| **Users / auth** | Hardest | Everything depends on it, and it's on every request's critical path. Extract last, if ever |
+
+The pattern: **extract things that are asynchronous, read-mostly, or leaf-like** (nothing else depends on their reply). Keep chatty, transactional cores together.
+
+Your honest answer for the blog today: it's a monolith, and that's the right architecture. Celery already gives you its biggest operational benefit (isolating slow work) with none of the distributed-systems tax.
+
+## Part 6: The middle path, a modular monolith
+
+You get most of the maintainability benefit with none of the network cost by **enforcing boundaries inside the monolith**. Until now, everything has lived in one `posts` app. Practice splitting it.
+
+### Target layout
+
+```
+accounts/        Profile, registration, auth views
+posts/           Post, Category, Like, Comment, the viewsets
+notifications/   emails, tasks, receivers   ← the future extraction candidate
+```
+
+### Rules
+
+1. **Each app owns its tables and internals.** Others don't import its models or reach into its views.
+2. **Cross-app calls go through a small public surface**, such as `services.py` functions or signals.
+3. **Dependencies point one way.** `notifications` may know about the events `posts` emits, but `posts` must not import `notifications`.
+
+### Invert the dependency with a signal (Day 12 payoff)
+
+```python
+# posts/signals.py   (no model imports, as on Day 12)
+from django.dispatch import Signal
+
+post_published = Signal()      # args: post_id
+comment_created = Signal()     # args: comment_id, post_id, post_author_id, commenter_id
+```
+
+```python
+# posts/receivers.py  (posts announces, and knows nothing about who listens)
+@receiver(post_save, sender=Comment, dispatch_uid="announce_comment_created")
+def announce_comment(sender, instance, created, raw=False, **kwargs):
+    if created and not raw:
+        payload = dict(
+            comment_id=instance.pk,
+            post_id=instance.post_id,
+            post_author_id=instance.post.author_id,
+            commenter_id=instance.author_id,
+        )
+        transaction.on_commit(
+            lambda: comment_created.send_robust(sender=Comment, **payload)
+        )
+```
+
+```python
+# notifications/receivers.py  (notifications depends on posts' signals, not the reverse)
+from posts.signals import comment_created
+from .tasks import send_comment_notification
+
+@receiver(comment_created, dispatch_uid="notify_on_comment_created")
+def on_comment_created(sender, comment_id, **kwargs):
+    send_comment_notification.delay(comment_id)
+```
+
+Move `send_comment_notification` into `notifications/tasks.py`. It should ask for what it needs through a `posts/services.py` function such as `get_comment_for_notification(comment_id)`, not by running ORM queries against `posts` internals. Register `notifications` in `INSTALLED_APPS` and import its receivers in its own `AppConfig.ready()`.
+
+Now deleting the `notifications` app from `INSTALLED_APPS` leaves `posts` working, just silent. That's what "loosely coupled" means in practice, and it's also the first step of any later extraction.
+
+### Enforce it with a tool, not good intentions
+
+`import-linter` fails your CI when someone breaks a boundary. Check the docs for your version, but a contract looks roughly like:
+
+```ini
+[importlinter]
+root_packages =
+    posts
+    notifications
+    accounts
+
+[importlinter:contract:posts-independent-of-notifications]
+name = posts must not import notifications
+type = forbidden
+source_modules = posts
+forbidden_modules = notifications
+```
+
+```bash
+pip install import-linter
+lint-imports
+```
+
+Boundaries that aren't checked mechanically erode within months.
+
+### The hard bit: foreign keys across apps
+
+`Comment.author` pointing at the user table is a cross-app dependency. In a modular monolith that's acceptable (it's one database and referential integrity is valuable). It's also exactly the coupling that would hurt if `accounts` became a service. Note where such links exist; they are your future extraction cost.
+
+## Part 7: If you extract later, the strangler pattern
+
+Extracting notifications, from safest to riskiest steps:
+
+1. **Draw the boundary in code** (Part 6). Don't skip it. Most failed extractions skipped it.
+2. **Give it its own tables.** No more reads of `posts` tables from `notifications`. Anything it needs arrives in the event or through an API.
+3. **Replace the in-process signal with a message** over a broker, written reliably (the outbox: save the event row in the same transaction as the comment, and a relay publishes it). The event is the contract:
+   ```json
+   {
+     "event": "comment.created",
+     "version": 1,
+     "comment_id": 123,
+     "post_id": 7,
+     "post_author_id": 2,
+     "commenter_id": 5,
+     "occurred_at": "2026-11-16T10:00:00Z"
+   }
+   ```
+   A "fat" event (carries the data) avoids call-backs but duplicates data. A "thin" event (ids only) stays small but forces the consumer to call back, which couples availability again. Pick deliberately.
+4. **Run the new service alongside the old code path**, compare behavior, then switch traffic, then delete the old code. This is the "strangler" part: you replace the system gradually, never in one risky cutover.
+5. **Version the contract.** Old consumers and new producers will coexist during every deploy.
+
+The rule that prevents a distributed monolith: **each service owns its data, and no one reads another's database.** If two services share tables, you have the costs of both architectures and the benefits of neither.
+
+## Part 8: The reading
+
+Martin Fowler's **"MonolithFirst"** is a short bliki article, which I believe lives at `https://martinfowler.com/bliki/MonolithFirst.html`. I haven't fetched it just now, so confirm the link and find the article through his site if it has moved. Read his related **"MicroservicePremium"** and **"Microservice Prerequisites"** pieces as well, and then search for a published counter-argument (for example, Stefan Tilkov's piece arguing *against* starting with a monolith) to hear the other side.
+
+While reading, write your own answers to these, and don't copy phrases from the article:
+
+1. What evidence does Fowler offer, and how strong is it? (Look at what he says about his own sample size.)
+2. Why does he think early boundaries are likely wrong?
+3. What does he say makes a monolith *easy to split later*, and does your blog have that property?
+4. What does the counter-argument claim, and under what conditions would it be right?
+5. Which side fits a team of 3 people building your blog? A team of 60 building a payments platform?
+
+## Part 9: Decide and write it down
+
+Write an **Architecture Decision Record** in `docs/adr/0001-monolith.md`. It's a half page that explains the decision to a future teammate (or to you in six months):
+
+```markdown
+# ADR 1: Blog Platform stays a modular monolith
+
+## Status
+Accepted
+
+## Context
+(Team size, traffic, deploy frequency, what hurts today.)
+
+## Decision
+(One Django codebase, apps split by domain, boundaries enforced by import-linter.
+Celery workers scale separately, but share the codebase.)
+
+## Consequences
+(Good: simple deploys, transactions, fast refactors.
+Bad: whole-app deploys, shared failure domain, scaling is coarse.)
+
+## Triggers to revisit
+(Specific, measurable conditions: e.g. "notification volume needs a worker pool that
+deploys on its own cadence", "two teams blocked on each other's releases more than
+X times a month", "search needs a dedicated engine".)
+```
+
+The **triggers** section is what makes this useful. You choose the thresholds from your own situation, and any numbers I'd suggest would be invented. A decision with no revisit conditions is just an opinion.
+
+## Experiments (45 min)
+
+1. **Map your dependencies.** Run `grep -rn "^from \|^import " --include=*.py posts/ | sort | uniq -c | sort -rn | head -30`, or use `pydeps` for a graph. Which parts of `posts` would be hard to pull out, and why?
+2. **Build the network boundary.** Start this stub (`pip install fastapi uvicorn`, then `uvicorn stub:app --port 9000`):
+   ```python
+   # stub.py
+   import time
+   from fastapi import FastAPI
+
+   app = FastAPI()
+
+   @app.get("/users/{uid}")
+   def one(uid: int):
+       time.sleep(0.02)                       # pretend: network plus work
+       return {"id": uid, "username": f"user{uid}"}
+
+   @app.get("/users")
+   def many(ids: str):
+       time.sleep(0.02)
+       return [{"id": int(i), "username": f"user{i}"} for i in ids.split(",")]
+   ```
+   Time listing 10 posts with `author_name()` per post (about 10 × 20 ms) versus one batched call (about 20 ms). That's the N+1 problem across a network.
+3. **Kill the stub** mid-request. What does your list endpoint return? Decide on a behavior (error, "Unknown author", cached name) and implement a timeout plus fallback. You've just designed a degradation strategy.
+4. **Count your moving parts.** From your Day 21 Compose file, list every process type (nginx, app, Postgres, Redis, worker, beat). Your "monolith" is already about 7 or 8 things to operate. Imagine each of 6 more services getting its own set.
+5. **Deploy-independence test.** Could you ship a change to the email text without restarting the web servers? Today no, because they share an image. What's the smallest change that makes it yes?
+6. **Transaction exercise on paper.** In a notifications microservice, what happens if the comment commits but the event is never published? What if it's published twice? Which Day 18 idea handles each?
+7. **Availability math.** For a request that synchronously calls 4 services at 99.9% each, compute the combined availability. Then redo it with one of them made asynchronous.
+8. **Do the Part 6 refactor** for notifications, then delete `notifications` from `INSTALLED_APPS` and confirm `posts` still works and its tests pass.
+
+## Stretch goals
+
+- Add the `import-linter` contract and make it fail on purpose by importing something forbidden.
+- Add an `Event` outbox table and a periodic task that publishes pending rows (the Day 18 and 19 stretch).
+- Add a correlation id middleware (`X-Request-ID`), log it everywhere, and pass it into Celery task headers so one request can be followed across processes.
+- Read about OpenTelemetry and the three pillars of observability (logs, metrics, traces).
+- Look up the **saga pattern** and write a three-step saga for "publish post, index in search, notify subscribers" with its compensating actions.
+- Read about the **API gateway** and **backend-for-frontend** patterns and note where nginx fits.
+
+## Day 22 checklist
+
+- [ ] Can define monolith, modular monolith, microservices, and distributed monolith
+- [ ] Can list five costs of a network boundary
+- [ ] Can explain why microservices are mainly an organizational scaling tool
+- [ ] Can give three good and three bad reasons to split
+- [ ] Ranked the blog's extraction candidates and justified the order
+- [ ] Split notifications into its own app, with `posts` unaware of it
+- [ ] Added (or wrote) an import-linter contract
+- [ ] Measured N+1 over a simulated network and added a timeout plus fallback
+- [ ] Read Fowler's article and one counter-argument, and answered the five questions in your own words
+- [ ] Wrote the ADR with concrete revisit triggers
+
+## Common gotchas
+
+- **Distributed monolith**: services that share a database or must deploy in lockstep. You pay for both architectures.
+- **Shared database "just for now"**: it becomes permanent, and any schema change then breaks several services at once.
+- **Splitting by technical layer** (a "database service", a "validation service") instead of by business capability.
+- **Nano-services**: so small that every feature touches five of them.
+- **Chatty services and synchronous chains**: latency adds and availability multiplies.
+- **Assuming the network is reliable**: always set timeouts, and decide what each call does when it fails.
+- **Forgetting that there's no cross-service transaction**: design for eventual consistency and duplicates (idempotent consumers, Day 18).
+- **Splitting before boundaries are clear**: you'll cut in the wrong place and pay to move it.
+- **Big-bang rewrites**: extract one slice at a time and keep the old path working until the new one proves itself.
+- **No observability**: without correlation ids and tracing, debugging across services is guesswork.
+- **Confusing "messy" with "monolith"**: the cure for a tangled codebase is modularity, which you can do without a network.
+- **Treating microservices as a goal**: they're a tool for specific problems, and the goal is shipping a product that works.
+- **A module boundary nobody enforces**: without a linter or review rule it won't last.
+
+Day 23 is likely **database scaling**, carried over from Day 21: PostgreSQL indexes and `EXPLAIN ANALYZE`, connection pooling with PgBouncer, and read replicas with Django's `DATABASE_ROUTERS`. The alternative is event-driven architecture (message brokers, outbox, and event contracts), which continues straight on from today's Part 7. Which do you want next?
