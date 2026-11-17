@@ -1,0 +1,672 @@
+# Day 23: API Design Best Practices
+
+An API is a contract with clients you can't see, and every rule today exists because changing a published contract is expensive. Your Blog API has no clients yet, so this is the cheapest moment you'll ever have to fix its shape. The task for today is to review the API from Days 7 to 22 against five rules and fix what breaks.
+
+## Part 0: A design flaw I introduced on Days 8 and 9
+
+`PostDetailSerializer` nests `comments = CommentSerializer(many=True)`. That violates today's pagination rule: a post with 50,000 comments returns all of them in one response. It's also an N+1, since each comment's `StringRelatedField` author triggers a query unless you prefetch it. And Day 15 caches that whole payload. The fix is in Part 4, and it's a good example of why contracts are cheaper to fix before anyone depends on them.
+
+## Part 1: The five rules and why
+
+| Rule | Cost of ignoring it |
+|---|---|
+| **Version from day one** | The first breaking change forces every client to break at once |
+| **One error shape everywhere** | Clients write special-case parsing for each endpoint |
+| **Paginate every collection** | One big row set takes down the server, and the fix changes the response shape |
+| **Idempotent retries** | Network failures cause duplicate posts, double charges, and angry users |
+| **Predictable semantics** (status codes, names, formats) | Every endpoint must be learned individually |
+
+## Part 2: Versioning
+
+### Strategies
+
+| Strategy | Example | Pros | Cons |
+|---|---|---|---|
+| **URL path** | `/api/v1/posts/` | Visible, cacheable, easy to route, test, and curl | URL changes between versions |
+| **Header / media type** | `Accept: application/vnd.blog.v2+json` | "Pure" REST, stable URLs | Hidden, harder to debug, and CDNs and caches need `Vary` |
+| **Query param** | `/api/posts/?version=2` | Easy | Easy to forget, pollutes cache keys |
+| **None** | `/api/posts/` | Simplest today | Painful the first time you break something |
+
+For a public JSON API, **URL path versioning** is the pragmatic default, and it's what you'll see most often.
+
+### What counts as breaking
+
+| Non-breaking (stay in v1) | Breaking (needs v2) |
+|---|---|
+| Adding a new endpoint | Removing or renaming an endpoint or field |
+| Adding an optional request field | Changing a field's type (`"author": "alice"` to an object) |
+| Adding a response field | Making an optional input required |
+| Adding a new enum value (*clients must tolerate unknowns*) | Tightening validation (shorter max length) |
+| Loosening validation | Changing the meaning of a field, status code, or error code |
+
+Clients must ignore fields they don't recognize. That "tolerant reader" rule is what makes additive changes safe.
+
+**Design for growth now.** `"author": "alice"` is a bare string, so you can never add the author's id or avatar without breaking clients. Use objects for things that may grow:
+
+```python
+class AuthorSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = get_user_model()
+        fields = ["id", "username"]
+
+# PostListSerializer
+author = AuthorSerializer(read_only=True)
+```
+
+Do this before v1 ships. After that, it costs a v2.
+
+### Implement it
+
+The simplest version is a prefix in the root urls:
+
+```python
+# blog_platform/urls.py
+urlpatterns = [
+    path("admin/", admin.site.urls),
+    path("api/v1/", include("posts.api_urls")),
+    path("healthz/", include("posts.health_urls")),   # operational: NOT versioned
+    # ...
+]
+```
+
+Keep `app_name = "posts_api"` in `api_urls.py`, so `reverse("posts_api:post-list")` now yields `/api/v1/posts/`. Update your tests from `/api/...` to `/api/v1/...`.
+
+Two decisions here:
+
+- **Health checks stay outside the version prefix.** Your load balancer (Day 21) shouldn't need updating when the API changes.
+- **No clients yet means a hard cut.** If clients exist, redirect with **308**, not 301/302, because the older codes may turn a POST into a GET:
+
+  ```python
+  def legacy_api_redirect(request, rest):
+      url = f"/api/v1/{rest}"
+      if request.META.get("QUERY_STRING"):
+          url += "?" + request.META["QUERY_STRING"]
+      response = HttpResponse(status=308)
+      response["Location"] = url
+      return response
+
+  # after the api/v1/ line:
+  re_path(r"^api/(?!v\d+/)(?P<rest>.*)$", legacy_api_redirect),
+  ```
+
+**When v2 arrives:** don't include the same urlconf twice (you'll get duplicate-namespace warnings). Create a separate `posts/api/v2/` package and reuse serializers and views only where behavior is identical. If most code is shared, DRF's `URLPathVersioning` lets one view branch on `request.version`:
+
+```python
+REST_FRAMEWORK["DEFAULT_VERSIONING_CLASS"] = "rest_framework.versioning.URLPathVersioning"
+REST_FRAMEWORK["ALLOWED_VERSIONS"] = ["v1"]
+REST_FRAMEWORK["DEFAULT_VERSION"] = "v1"
+# route: path("api/<str:version>/", include("posts.api_urls"))
+```
+
+Don't add this until you have a v2. It's machinery you don't need yet.
+
+### Two consequences for your existing code
+
+- **Cached responses hold the old shape.** Day 15's detail cache stores serialized output. After you change a serializer, stale entries serve the old shape for up to ~6 minutes. Put a shape version in the keys, in the one place that builds them: `f"v1:post:{slug}:detail"` in `post_detail_key()`. Day 16's centralization pays off here.
+- **Retiring a version needs a lifecycle.** Announce deprecation with response headers (`Deprecation`, and `Sunset` from RFC 8594 for the shutdown date), a changelog, and a migration guide. Check the current RFC for the exact `Deprecation` value format. Then monitor v1 traffic (log the path prefix) and don't switch it off until the numbers say it's safe.
+
+## Part 3: One error shape everywhere
+
+### What you have today
+
+Run these and write down each response body:
+
+| Request | Today's body |
+|---|---|
+| POST with a short title | `{"title": ["Title must be at least 5..."]}` |
+| Anonymous POST | `{"detail": "Authentication credentials were not provided."}` |
+| `GET /api/v1/posts/nope/` | `{"detail": "Not found."}` |
+| `GET /api/v1/posts/?page=999` | `{"detail": "Invalid page."}` |
+| `GET /api/v1/posts/?category=nope` | `{"category": ["Select a valid choice..."]}` |
+| Bad login | `{"non_field_errors": ["Unable to log in..."]}` |
+| Throttled | `{"detail": "Request was throttled..."}` |
+| `GET /api/v1/nonexistent/` | **An HTML page** |
+| Unhandled exception (DEBUG off) | **An HTML page** |
+
+That's at least four shapes, two of them not JSON. A client needs a different error parser for each.
+
+### The contract
+
+```json
+{
+  "error": {
+    "code": "validation_error",
+    "message": "One or more fields are invalid.",
+    "details": {"title": ["Title must be at least 5 characters."]},
+    "request_id": "9b1c0f6e2a7d4c1f8b3e5d6a7c8b9e0f"
+  }
+}
+```
+
+- **`code`** is machine-readable and stable. Clients branch on this, never on `message`.
+- **`message`** is for humans and may change wording.
+- **`details`** is field errors for validation and `{}` otherwise.
+- **`request_id`** lets a user quote one id and you find the exact log lines (Day 22's correlation id).
+
+This is a custom envelope. There's also a standard, RFC 9457 "Problem Details" (`application/problem+json`, with `type`, `title`, `status`, `detail`). If you expect third-party consumers, it's worth following. What matters most is picking one shape and never deviating.
+
+### Implementation
+
+**posts/exceptions.py**
+```python
+from rest_framework import exceptions
+from rest_framework.views import exception_handler
+
+STATUS_CODES = {
+    400: "bad_request", 401: "not_authenticated", 403: "permission_denied",
+    404: "not_found", 405: "method_not_allowed", 429: "throttled",
+}
+
+
+def _code(exc, status):
+    if isinstance(exc, exceptions.APIException):
+        codes = exc.get_codes()
+        if isinstance(codes, str):
+            return codes
+    return STATUS_CODES.get(status, "error")   # Django's Http404 / PermissionDenied land here
+
+
+def api_exception_handler(exc, context):
+    response = exception_handler(exc, context)
+    if response is None:
+        return None                              # unhandled: falls through to handler500
+
+    if isinstance(exc, exceptions.ValidationError):
+        details = response.data
+        if not isinstance(details, dict):
+            details = {"non_field_errors": details}
+        body = {"code": "validation_error",
+                "message": "One or more fields are invalid.",
+                "details": details}
+    else:
+        data = response.data
+        message = data.get("detail", "") if isinstance(data, dict) else ""
+        body = {"code": _code(exc, response.status_code),
+                "message": str(message), "details": {}}
+
+    body["request_id"] = getattr(context.get("request"), "request_id", None)
+    response.data = {"error": body}              # headers (Retry-After, WWW-Authenticate) survive
+    return response
+```
+
+Changing only `response.data` keeps `Retry-After` on 429s and `WWW-Authenticate` on 401s. Don't rebuild the response.
+
+**posts/middleware.py** (next to `ServedByMiddleware`)
+```python
+import re
+import uuid
+
+_VALID_ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+class RequestIDMiddleware:
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        incoming = request.headers.get("X-Request-ID", "")
+        request.request_id = incoming if _VALID_ID.match(incoming) else uuid.uuid4().hex
+        response = self.get_response(request)
+        response["X-Request-ID"] = request.request_id
+        return response
+```
+
+The regex matters. An unvalidated client-supplied header goes straight into your logs and responses, which allows log injection. Put this middleware **first** in `MIDDLEWARE`, so every later layer and every log line can use it.
+
+**settings.py**
+```python
+REST_FRAMEWORK["EXCEPTION_HANDLER"] = "posts.exceptions.api_exception_handler"
+```
+
+**JSON for unmatched URLs and crashes** (DRF never sees these):
+
+```python
+# blog_platform/views.py
+from django.http import JsonResponse
+from django.views.defaults import page_not_found, server_error
+
+
+def _error(request, status, code, message):
+    return JsonResponse(
+        {"error": {"code": code, "message": message, "details": {},
+                   "request_id": getattr(request, "request_id", None)}},
+        status=status,
+    )
+
+
+def json_404(request, exception, *args, **kwargs):
+    if request.path.startswith("/api/"):
+        return _error(request, 404, "not_found", "No such endpoint.")
+    return page_not_found(request, exception, *args, **kwargs)
+
+
+def json_500(request, *args, **kwargs):
+    if request.path.startswith("/api/"):
+        return _error(request, 500, "server_error", "Something went wrong on our side.")
+    return server_error(request, *args, **kwargs)
+```
+
+```python
+# blog_platform/urls.py
+handler404 = "blog_platform.views.json_404"
+handler500 = "blog_platform.views.json_500"
+```
+
+These handlers are only used when `DEBUG = False`. With `DEBUG = True` you still get Django's debug pages, so test with `DEBUG` off. The 500 body never contains the exception text, because internal details are an information leak. The `request_id` is how you find the traceback in your logs.
+
+### Status code guide
+
+| Situation | Code | Notes |
+|---|---|---|
+| Created | **201** + `Location` header | Add the header (below) |
+| Success, nothing to return | **204** | DELETE, unlike |
+| Malformed or invalid input | **400** | DRF's default for validation |
+| Not logged in | **401** | Needs `WWW-Authenticate`: token auth first (Day 10) |
+| Logged in but forbidden | **403** | |
+| Doesn't exist, or you may not know it exists | **404** | Others' drafts return 404 (Day 9), a deliberate choice |
+| Method not allowed | **405** | |
+| Conflict with current state / key in use | **409** | |
+| Semantically wrong request (idempotency key reuse) | **422** | |
+| Throttled | **429** + `Retry-After` | |
+| Server bug | **500** | Never include internals |
+
+DRF doesn't send `Location` on create unless your serializer has a `url` field. Add it:
+
+```python
+from django.urls import reverse
+
+class PostViewSet(...):
+    def get_success_headers(self, data):
+        return {"Location": reverse("posts_api:post-detail", kwargs={"slug": data["slug"]})}
+```
+
+## Part 4: Paginate everything
+
+**The rule: no endpoint returns a collection of unknown size.** If a list can grow with usage, it needs a cap.
+
+### Audit
+
+| Collection | Status |
+|---|---|
+| `GET /posts/` | Paginated, capped at 50 ✅ |
+| `GET /posts/{slug}/comments/` | Paginated by the global default ✅ |
+| `GET /posts/popular/` | `pagination_class=None`, but hard-limited with `[:10]` ✅ (bounded by construction) |
+| **`comments` nested in post detail** | **Unbounded** ❌ |
+| `categories` on a post | Small and naturally bounded, fine |
+| Any `GET /categories/` you built | Paginated by default if it's a generic view |
+
+### Fix the nested comments
+
+Remove the nested list and link to the paginated endpoint:
+
+```python
+from django.urls import reverse
+
+class PostDetailSerializer(PostListSerializer):
+    comments_url = serializers.SerializerMethodField()
+
+    class Meta(PostListSerializer.Meta):
+        fields = PostListSerializer.Meta.fields + ["body", "comments_url", "updated_at"]
+
+    def get_comments_url(self, obj):
+        return reverse("posts_api:comment-list", kwargs={"post_slug": obj.slug})
+```
+
+Two details: `comment_count` (already in the list serializer) tells clients how many exist, and the URL is **relative on purpose**. An absolute URL built from `request` would embed the first requester's host into the Day 15 cached response and serve it to everyone. Removing `comments` is a breaking change, and doing it now, before v1 is published, is the point.
+
+### One paginator everywhere
+
+Use the Day 11 class globally so every list gets the same params and cap:
+
+```python
+REST_FRAMEWORK["DEFAULT_PAGINATION_CLASS"] = "posts.pagination.StandardPagination"
+REST_FRAMEWORK["PAGE_SIZE"] = 10          # keep it set as well
+```
+
+### Page numbers vs cursors
+
+| | `PageNumberPagination` | `CursorPagination` |
+|---|---|---|
+| Client does | `?page=3` | follows `next` links only |
+| Jump to page N | ✅ | ❌ |
+| Total `count` | ✅ (extra `COUNT(*)`) | ❌ |
+| New rows arrive during paging | Duplicates or skips | Stable |
+| Deep pages | `OFFSET` gets slower | Constant cost |
+| Arbitrary `?ordering=` | ✅ | Limited to the configured ordering |
+| Good for | Admin-style tables, UIs with page numbers | Feeds, infinite scroll, huge or fast-moving tables |
+
+```python
+from rest_framework.pagination import CursorPagination
+
+class FeedCursorPagination(CursorPagination):
+    page_size = 10
+    ordering = ("-created_at", "-id")      # must be stable; the id breaks ties
+```
+
+For the blog's main list, page numbers are fine. Know the cursor option exists for a feed.
+
+## Part 5: Idempotency
+
+### A terminology fix
+
+Your outline says PUT and DELETE should be *safe* to retry. The precise words:
+
+- **Safe**: the request doesn't change server state (GET, HEAD, OPTIONS).
+- **Idempotent**: sending it N times leaves the server in the same state as sending it once.
+
+DELETE and PUT are idempotent but not safe.
+
+| Method | Safe | Idempotent | Retry on a network failure? |
+|---|---|---|---|
+| GET / HEAD / OPTIONS | ✅ | ✅ | Yes |
+| PUT | ❌ | ✅ | Yes |
+| DELETE | ❌ | ✅ | Yes |
+| PATCH | ❌ | **Not guaranteed** | Depends: `{"title": "x"}` is fine, but "increment views" isn't |
+| POST | ❌ | ❌ | **No**, unless you add an idempotency key |
+
+### "Same state" doesn't mean "same response"
+
+`DELETE /posts/x/` returns **204** the first time and **404** on a retry. The state is identical (the post is gone), so DELETE is idempotent, but the response differs. Choose one and document it:
+
+1. **Leave DRF's default** (404 on retry) and tell clients "treat 404 after DELETE as success". Simplest, and it matches what DRF does.
+2. **Return 204 always.** Friendlier to clients, but it complicates permission semantics, since a 403 for someone else's post still reveals the post exists.
+
+I'd take option 1 and write it in the docs.
+
+### Make `like` idempotent for real
+
+Your `POST /posts/{slug}/like/` already uses `get_or_create`, so the *state* is idempotent, but the method is POST and the status flips between 201 and 200. "I like this post" is a statement about a relationship, so model it as one:
+
+```python
+@action(detail=True, methods=["put", "delete"], permission_classes=[IsAuthenticated])
+def like(self, request, slug=None):
+    post = self.get_object()
+    if request.method == "PUT":
+        Like.objects.get_or_create(post=post, user=request.user)
+    else:
+        Like.objects.filter(post=post, user=request.user).delete()
+    return Response(status=204)
+```
+
+`PUT` twice leaves one like and `DELETE` twice leaves none, and both always return 204. Remember to add `"like"` to the lists in your `get_permissions`, and update the Day 13 test that expected 201 then 200.
+
+### POST with an `Idempotency-Key`
+
+For "create post" and "create comment", a client that times out and retries creates duplicates. The standard remedy is a client-generated key (a UUID) sent as a header. The server remembers the key and replays the stored response.
+
+```
+POST /api/v1/posts/
+Idempotency-Key: 3f6c1b52-8d3a-4e8e-a4de-0f0d5a8f3c11
+```
+
+**posts/idempotency.py**
+```python
+import hashlib
+import json
+import re
+
+from django.core.cache import cache
+from rest_framework.exceptions import APIException, ValidationError
+from rest_framework.response import Response
+
+KEY_RE = re.compile(r"^[A-Za-z0-9._-]{8,100}$")
+TTL = 60 * 60 * 24
+
+
+class IdempotencyInProgress(APIException):
+    status_code = 409
+    default_code = "idempotency_in_progress"
+    default_detail = "A request with this Idempotency-Key is still being processed."
+
+
+class IdempotencyKeyReused(APIException):
+    status_code = 422
+    default_code = "idempotency_key_reused"
+    default_detail = "This Idempotency-Key was already used with a different request."
+
+
+class IdempotentCreateMixin:
+    """Put before ModelViewSet in the bases. Honors Idempotency-Key on create."""
+
+    def create(self, request, *args, **kwargs):
+        key = request.headers.get("Idempotency-Key")
+        if not key or not request.user.is_authenticated:
+            return super().create(request, *args, **kwargs)
+        if not KEY_RE.match(key):
+            raise ValidationError({"Idempotency-Key": ["Use 8-100 chars: letters, digits, . _ -"]})
+
+        fingerprint = hashlib.sha256(
+            json.dumps(request.data, sort_keys=True, default=str).encode()
+        ).hexdigest()
+        slot = f"idem:{request.user.pk}:{request.path}:{key}"
+
+        if not cache.add(slot, {"state": "processing", "fp": fingerprint}, 60):   # atomic claim
+            saved = cache.get(slot)
+            if saved is None:                        # expired, or cache trouble: fail open
+                return super().create(request, *args, **kwargs)
+            if saved["fp"] != fingerprint:
+                raise IdempotencyKeyReused()
+            if saved["state"] == "processing":
+                raise IdempotencyInProgress()
+            replay = Response(saved["data"], status=saved["status"])
+            replay["Idempotent-Replayed"] = "true"
+            return replay
+
+        try:
+            response = super().create(request, *args, **kwargs)
+        except Exception:
+            cache.delete(slot)                       # failed: let the client retry with the same key
+            raise
+        if 200 <= response.status_code < 300:
+            cache.set(slot, {
+                "state": "done", "fp": fingerprint, "status": response.status_code,
+                "data": json.loads(json.dumps(response.data, default=str)),
+            }, TTL)
+        else:
+            cache.delete(slot)
+        return response
+```
+
+```python
+class PostViewSet(IdempotentCreateMixin, viewsets.ModelViewSet): ...
+class CommentViewSet(IdempotentCreateMixin, viewsets.ModelViewSet): ...
+```
+
+The reasoning behind each piece:
+
+- **Scoped by user and path.** Two users generating the same UUID can't collide or replay each other's data.
+- **A fingerprint of the body.** Reusing a key for a *different* request is a client bug, so it gets 422, not a silent wrong replay.
+- **`cache.add` is atomic.** Two simultaneous retries can't both run, and the loser gets 409.
+- **Only 2xx is stored.** A failed attempt can be retried with the same key.
+- **It fails open if the cache is unavailable**, matching Day 19's philosophy. That means duplicates are possible during a Redis outage.
+
+**Honest limitation:** a cache is not durable. Redis can lose the key (restart, eviction), and then a retry creates a duplicate. For operations where a duplicate is costly (payments, orders), store keys in a **database table with a unique constraint** and write them in the same transaction as the create. The cache version is fine for a blog.
+
+Natural keys help too. `Like` has a unique constraint on (post, user) and `Post.slug` is unique, so a retried create of the same slug fails with a 400 instead of creating a duplicate. That's a form of idempotency by constraint.
+
+### Lost updates, one step further
+
+PUT is idempotent, but two clients doing read-modify-write can silently overwrite each other. The fix is optimistic concurrency: return an `ETag`, require `If-Match` on writes, and answer **412 Precondition Failed** on a mismatch. It's a stretch goal below.
+
+## Part 6: Review your API, fix the violations
+
+Work down this table against your actual code:
+
+| # | Check | Likely violation | Fix |
+|---|---|---|---|
+| 1 | Every route under `/api/v1/` | Routes under `/api/` | Part 2 |
+| 2 | Health checks outside the version prefix | Inside `/api/` | Move to `/healthz/` |
+| 3 | Every error has the `error` envelope | 4+ shapes, plus HTML for 404 and 500 | Part 3 |
+| 4 | Error `code` values are stable and documented | None exist | Document them in the README |
+| 5 | No unbounded lists | Nested comments in detail | Part 4 |
+| 6 | One paginator, capped | Global default has no cap | Part 4 |
+| 7 | Bare scalars that may grow | `author` as a string | `AuthorSerializer` |
+| 8 | `201` creates send `Location` | No header | `get_success_headers` |
+| 9 | DELETE and PUT retry-safe, behavior documented | 404 on repeated DELETE undocumented | Document it |
+| 10 | `like` is a PUT/DELETE relationship | POST toggling 201 or 200 | Part 5 |
+| 11 | POST create accepts `Idempotency-Key` | Duplicates on retry | Part 5 |
+| 12 | No leftover scratch endpoints | **Day 20's `WhoAmIView`** exposes the process id and has no auth | **Delete it** |
+| 13 | Throttled responses include `Retry-After` | Already true | Verify |
+| 14 | Resource names are plural nouns, verbs only for non-CRUD actions | `/like/` and `/popular/` are the only verb-ish routes | Fine, they're actions |
+| 15 | Consistent formats | Timestamps ISO 8601 UTC, `snake_case` fields | Verify in output |
+| 16 | Cache keys include the shape version | Unversioned | `v1:` prefix |
+| 17 | Filter and ordering param names consistent across endpoints | Probably fine, check comments | `CommentFilter` if needed |
+
+## Part 7: Contract tests
+
+```python
+from rest_framework.test import APITestCase
+
+User = get_user_model()
+
+
+class ApiContractTests(APITestCase):
+    def setUp(self):
+        self.alice = User.objects.create_user("alice", password="pass12345")
+        self.post = Post.objects.create(
+            author=self.alice, title="A fine post", slug="a-fine-post",
+            body="x" * 60, status=Post.Status.PUBLISHED,
+        )
+
+    def assert_error(self, response, status, code):
+        self.assertEqual(response.status_code, status)
+        err = response.json()["error"]
+        self.assertEqual(err["code"], code)
+        self.assertEqual(set(err), {"code", "message", "details", "request_id"})
+        self.assertTrue(err["request_id"])
+        return err
+
+    def test_all_errors_share_one_shape(self):
+        self.assert_error(self.client.get("/api/v1/posts/nope/"), 404, "not_found")
+        self.assert_error(self.client.get("/api/v1/nonexistent/"), 404, "not_found")
+        self.assert_error(self.client.post("/api/v1/posts/", {}), 401, "not_authenticated")
+        self.assert_error(self.client.get("/api/v1/posts/?page=999"), 404, "not_found")
+
+    def test_validation_error_has_field_details(self):
+        self.client.force_authenticate(self.alice)
+        r = self.client.post("/api/v1/posts/", {"title": "Hi", "slug": "hi", "body": "x"})
+        err = self.assert_error(r, 400, "validation_error")
+        self.assertIn("title", err["details"])
+
+    def test_request_id_is_echoed_and_sanitized(self):
+        r = self.client.get("/api/v1/posts/", HTTP_X_REQUEST_ID="abc-123")
+        self.assertEqual(r["X-Request-ID"], "abc-123")
+        r = self.client.get("/api/v1/posts/", HTTP_X_REQUEST_ID="bad id\nx")
+        self.assertNotEqual(r["X-Request-ID"], "bad id\nx")
+
+    def test_detail_has_no_unbounded_nesting(self):
+        data = self.client.get("/api/v1/posts/a-fine-post/").json()
+        self.assertNotIn("comments", data)
+        self.assertIn("comments_url", data)
+
+    def test_page_size_is_capped(self):
+        r = self.client.get("/api/v1/posts/?page_size=1000")
+        self.assertLessEqual(len(r.json()["results"]), 50)
+
+    def test_create_returns_location(self):
+        self.client.force_authenticate(self.alice)
+        r = self.client.post("/api/v1/posts/", {"title": "Brand new post", "slug": "brand-new", "body": "y" * 60})
+        self.assertEqual(r.status_code, 201)
+        self.assertEqual(r["Location"], "/api/v1/posts/brand-new/")
+
+    def test_delete_is_idempotent_in_state(self):
+        self.client.force_authenticate(self.alice)
+        self.assertEqual(self.client.delete("/api/v1/posts/a-fine-post/").status_code, 204)
+        self.assertEqual(self.client.delete("/api/v1/posts/a-fine-post/").status_code, 404)
+        self.assertFalse(Post.objects.filter(slug="a-fine-post").exists())
+
+    def test_put_like_twice_leaves_one_like(self):
+        self.client.force_authenticate(self.alice)
+        self.assertEqual(self.client.put("/api/v1/posts/a-fine-post/like/").status_code, 204)
+        self.assertEqual(self.client.put("/api/v1/posts/a-fine-post/like/").status_code, 204)
+        self.assertEqual(Like.objects.filter(post=self.post).count(), 1)
+
+
+@override_settings(CACHES=LOCMEM)          # LOCMEM from Day 15
+class IdempotencyKeyTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.alice = User.objects.create_user("alice", password="pass12345")
+        self.client.force_authenticate(self.alice)
+        self.payload = {"title": "Retry safe post", "slug": "retry-safe", "body": "z" * 60}
+
+    def test_same_key_creates_once_and_replays(self):
+        h = {"HTTP_IDEMPOTENCY_KEY": "key-0001-abcdef"}
+        first = self.client.post("/api/v1/posts/", self.payload, **h)
+        second = self.client.post("/api/v1/posts/", self.payload, **h)
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 201)
+        self.assertEqual(second["Idempotent-Replayed"], "true")
+        self.assertEqual(first.json(), second.json())
+        self.assertEqual(Post.objects.filter(slug="retry-safe").count(), 1)
+
+    def test_same_key_different_body_is_422(self):
+        h = {"HTTP_IDEMPOTENCY_KEY": "key-0002-abcdef"}
+        self.client.post("/api/v1/posts/", self.payload, **h)
+        r = self.client.post("/api/v1/posts/", {**self.payload, "title": "Different title"}, **h)
+        self.assertEqual(r.status_code, 422)
+```
+
+One test intentionally missing is the 500 shape, because forcing an unhandled exception through the test client needs `raise_request_exception=False` plus a patched view. Check it by hand in the experiments.
+
+## Experiments (30 min)
+
+1. **Error census.** Before changing anything, hit the nine requests in Part 3's table and save the bodies. Repeat afterward and diff.
+2. **Force a 500** with `DEBUG=False`: temporarily `raise RuntimeError("boom")` in a view. Confirm the JSON body leaks no message, and use `request_id` to find the traceback in your logs. Then check what happens with `DEBUG=True`.
+3. **Unbounded vs bounded:** seed a post with 5,000 comments. Time the old detail response (`curl -w`) and note the body size, then repeat with `comments_url`.
+4. **Retry storm:** `for i in 1 2 3; do curl -X POST ... ; done` without a key creates 3 rows (or 400s from the unique slug). Repeat with the same `Idempotency-Key` and get one row.
+5. **Concurrent retries:** fire two identical keyed requests in parallel (`&` in the shell) with a `time.sleep(2)` in `perform_create`. One succeeds and the other gets 409.
+6. **Reuse a key** with a different body and read the 422.
+7. **Break a client on purpose:** write a 10-line script that reads `response.json()["author"]` as a string. Switch to the `AuthorSerializer` and see the break. That's your breaking-change lesson.
+8. **Stale shape:** change the detail serializer without bumping the cache key version, and see the old shape served from Redis. Then add `v1:` and watch it clear.
+9. **Wrong method on a retry:** compare a `PATCH` that sets `status` (idempotent) with a hypothetical "increment" action. Decide which verb the second deserves.
+10. **Cursor feed:** add `FeedCursorPagination` to a scratch viewset, insert posts while paging, and compare duplicates against page numbers.
+
+## Stretch goals
+
+- **ETag and `If-Match`** on `PUT` and `PATCH`, returning 412 on a stale write. Compute the ETag from `updated_at` (`F"{pk}-{updated_at.timestamp()}"`), or use `django.views.decorators.http.condition`.
+- **`drf-spectacular`** to generate an OpenAPI schema (`python manage.py spectacular --file schema.yml`), and document the error envelope and the `Idempotency-Key` header.
+- **`schemathesis`** to fuzz the API against that schema and find violations you didn't think of.
+- Add `X-RateLimit-*` style headers to throttled endpoints.
+- Write `docs/api-conventions.md`: versioning policy, the error codes list, pagination rules, and the DELETE-retry decision. This is the document your future self needs.
+- Turn the idempotency store into a **database table** with a unique constraint, written in the same transaction as the create.
+- Add a **deprecation header** middleware gated on a path prefix, ready for the day v2 ships.
+
+## Day 23 checklist
+
+- [ ] Can name the five rules and the cost of ignoring each
+- [ ] Can explain breaking vs non-breaking changes and the tolerant reader rule
+- [ ] All routes under `/api/v1/`; health checks outside it
+- [ ] One error envelope across DRF errors, unknown URLs, and 500s
+- [ ] `RequestIDMiddleware` sanitizes and echoes `X-Request-ID`
+- [ ] Nested comments removed, replaced with a relative `comments_url`
+- [ ] Global paginator is capped; can say when to prefer cursors
+- [ ] Can explain safe vs idempotent, and why DELETE returns 204 then 404
+- [ ] `like` is PUT/DELETE; create endpoints honor `Idempotency-Key`
+- [ ] `Location` header on 201
+- [ ] `WhoAmIView` deleted
+- [ ] Contract tests pass, and the cache key carries a shape version
+- [ ] Walked the 17-row audit and fixed each violation
+
+## Common gotchas
+
+- **Versioning only the URL while serializers change underneath:** the prefix is a promise, so every change must keep v1's behavior.
+- **Clients branching on `message`:** they will, so keep `code` stable and treat changing it as breaking.
+- **`handler404`/`handler500` not firing:** they only apply with `DEBUG = False`.
+- **Rebuilding the `Response` in the exception handler:** you lose `Retry-After` and `WWW-Authenticate`. Edit `response.data` only.
+- **Leaking exception text in 500s:** log the details, return the `request_id`.
+- **Trusting `X-Request-ID` from clients:** validate it, or you've created a log-injection hole.
+- **301/302 redirects for moved API paths:** POSTs may be re-sent as GETs. Use 308.
+- **Absolute URLs in cached payloads:** the first requester's host gets baked in. Use relative paths or build links outside the cache.
+- **Stale cache after a shape change:** serialized output lives in Redis, so version the keys.
+- **`PATCH` assumed idempotent:** it isn't if it applies a delta.
+- **Idempotency keys not scoped to the user:** one user can replay another's response.
+- **Idempotency keys not tied to the request body:** a reused key silently returns the wrong result.
+- **Storing failures under the key:** a 500 replayed forever. Store terminal successes only.
+- **Cache-based keys for money-like operations:** use a durable table with a unique constraint.
+- **Treating `count` as free:** every page runs an extra `COUNT(*)` on big tables. Cursors avoid it.
+- **Unbounded `?page_size`:** always set `max_page_size`.
+- **Putting `Idempotent-Replayed` or other custom headers into the contract by accident:** if you document them, you have to keep them.
+- **Versioning health and admin endpoints:** operational routes should never need a client migration.
+
+Day 24 could go to **API documentation and testing** (OpenAPI with `drf-spectacular`, fuzzing with `schemathesis`, and a CI pipeline that fails on contract drift), which follows directly from today. The alternative is the **database scaling** day that's been waiting since Day 21: indexes and `EXPLAIN ANALYZE`, PgBouncer, and read replicas. Which do you want next?
