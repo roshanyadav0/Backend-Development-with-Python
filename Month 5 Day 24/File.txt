@@ -1,0 +1,312 @@
+# Day 24: Django vs FastAPI, When to Recommend Which
+
+Day 13 compared a single endpoint. Today you turn that into a **decision tool**. The goal isn't picking a winner. It's being able to say "for this project, with this team, I'd choose X, because of Y, and here's what would change my mind."
+
+## Part 0: Two claims in the outline to sharpen
+
+1. **"FastAPI is faster."** It's faster *per core under high concurrency of I/O-bound work*, because async lets one process juggle thousands of waiting connections. For a typical CRUD API, the database dominates latency, and your Day 4 `select_related` and Day 15 cache matter far more than the framework. A slow query is equally slow in both.
+2. **"Django isn't async."** Django has supported ASGI, async views, and an async ORM interface (`aget`, `async for`, and so on) for several releases. Parts of that are thinner than they look (some paths still run sync code in threads), and DRF is largely synchronous. Check the current Django docs before relying on it.
+
+## Part 1: The core philosophies
+
+| | Django (+ DRF) | FastAPI |
+|---|---|---|
+| **Philosophy** | A full framework with one blessed way | A thin layer on Starlette and Pydantic; you assemble the rest |
+| **Born for** | Content sites, then APIs | APIs, with type hints as the organizing idea |
+| **Default model** | Synchronous, with async bolted on and improving | Async-first (sync `def` endpoints run in a threadpool) |
+| **Validation** | Serializers and forms (runtime classes) | Pydantic models driven by type hints |
+| **Docs** | Add `drf-spectacular` | Automatic OpenAPI and `/docs` |
+| **Data layer** | Django ORM, built in | Your choice: SQLAlchemy, SQLModel, Tortoise, raw SQL |
+| **Auth, admin, migrations** | Built in | Assemble (JWT helpers, SQLAdmin, Alembic) |
+
+The one-line version: **Django gives you the whole building and asks you to live in it. FastAPI gives you excellent doors and windows and asks you to build the rest.**
+
+## Part 2: Your blog, feature by feature
+
+You built every row of this in Django, so you can judge honestly what FastAPI would have cost.
+
+| Blog feature | Django/DRF (what you did) | FastAPI equivalent | Who saves time |
+|---|---|---|---|
+| Models plus tables | Models, `makemigrations` | SQLAlchemy models plus Alembic setup | Django |
+| Admin for editing posts (Day 5) | ~30 lines | SQLAdmin or a hand-built UI | **Django, by a lot** |
+| Users, passwords, permissions | `AUTH_USER_MODEL`, groups, `IsAdminUser` | Build user table, hashing, OAuth2 flow | **Django** |
+| CRUD endpoints | `ModelViewSet` plus router | Six hand-written routes (or a generator library) | Django |
+| Request validation | Serializer (separate from model) | Pydantic model from type hints | **FastAPI** (less ceremony) |
+| Filtering, search, pagination | `django-filter`, `SearchFilter`, paginators | Hand-written or `fastapi-pagination` | Django |
+| Signals (Day 12) | Built in | None; call functions explicitly or use events | Django |
+| Cache and Celery integration | Settings plus `django-redis` | Same libraries, wired manually | Roughly even |
+| API docs and schema | Needs `drf-spectacular` | Free, and typed end to end | **FastAPI** |
+| Streaming, WebSockets, many concurrent waits | Possible (Channels, ASGI), more setup | Native | **FastAPI** |
+| Typed request-to-response code | Dynamic serializers | Types flow through | **FastAPI** |
+
+Count the rows each wins. For *this* app the answer is clear, and it's an application with relational data, users, and an editing UI. That's Django's home ground.
+
+## Part 3: Async, what it does and doesn't buy
+
+Async helps when requests spend most of their time **waiting** (on an HTTP call, a slow external API, a socket) and you have many of them at once.
+
+```
+sync worker:   [request A ········wait········ done]   (worker blocked the whole time)
+async worker:  [A ··wait··]  [B ··wait··]  [C ··wait··]  (one thread interleaves them)
+```
+
+It does **not** help when:
+
+- The work is **CPU-bound** (image resizing, model inference on CPU). One event loop shares one core, and CPU work blocks everything.
+- The bottleneck is **the database**. Ten thousand async connections still queue on one Postgres, and connection limits still apply (Day 20).
+- The code has **one blocking call**. This is the classic FastAPI bug:
+
+```python
+@app.get("/report")
+async def report():
+    time.sleep(5)              # blocks the ENTIRE event loop: every request stalls
+    requests.get(url)          # same: a sync HTTP client inside async def
+```
+
+Fix by using `await asyncio.sleep`, an async client like `httpx.AsyncClient`, or just declare the endpoint `def` (FastAPI runs those in a threadpool). Counter-intuitively, a plain `def` endpoint is often safer than a careless `async def`.
+
+For the blog, your slow work already lives in **Celery** (Day 17), which sidesteps the whole question. Async web code becomes compelling when requests fan out to several services or hold connections open (chat, streaming, proxies).
+
+## Part 4: Where each wins
+
+### Django wins when
+
+- The product is **content-heavy with relational data** (CMS, blog, marketplace, internal tools).
+- **Non-developers need an admin.** This is the biggest single differentiator, and it's free.
+- **Prototype speed with full features** matters (auth, admin, ORM, forms, migrations on day one).
+- The team is **mixed-experience** and benefits from one conventional structure.
+- You want **a mature ecosystem** for boring problems (payments, SSO, CMSs, import/export).
+- Security defaults matter: CSRF, XSS escaping, clickjacking headers, password hashing, and SQL-injection protection are built in and well exercised.
+
+### FastAPI wins when
+
+- You're building a **pure API or microservice** with no templates, admin, or sessions.
+- The service is **I/O-fan-out heavy** (gateways, aggregators, webhooks, proxies), or needs **WebSockets and streaming**.
+- It's **ML model serving**: Pydantic schemas for inputs and outputs, a Python process holding a loaded model, and a team already living in the Python ML ecosystem (and typed contracts matter).
+- **Typed contracts and auto-docs** are the main deliverable (other teams consume your OpenAPI schema).
+- A **small, focused service** where assembling five libraries is cheaper than adopting a whole framework.
+
+### Genuinely either
+
+CRUD JSON APIs over a database with a small team. Here, **team familiarity beats framework features**. The better choice is usually whichever your team has shipped with before.
+
+## Part 5: The middle paths (you have options)
+
+| Option | What it is | Fits when |
+|---|---|---|
+| **Django Ninja** | FastAPI-style, Pydantic-typed endpoints *inside* Django | You want Django's ORM, admin, and auth with type-hint APIs and auto-docs |
+| **Django + one FastAPI sidecar** | Django monolith plus a small FastAPI service for one job (ML inference, a streaming endpoint) | One component has a different scaling or tech profile |
+| **Django + Channels** | WebSockets inside Django | Real-time features on a Django core |
+| **FastAPI + Django ORM** | Possible but awkward | Rarely worth it; pick one stack's data layer |
+
+The sidecar option is **Day 22 applied**: extract the thing with different scaling and technology needs (ML inference), keep the transactional core in the monolith. Your Django app calls it over HTTP with a timeout and fallback, exactly as Experiment 3 on Day 22 practiced.
+
+## Part 6: Costs people underestimate
+
+**Choosing FastAPI for a CRUD product, you'll end up building:**
+
+- user management, password reset, and token or session handling
+- an admin or back-office UI
+- a migration workflow, and a convention for sessions, transactions, and dependencies
+- permission checking (the equivalent of Days 9 and 10), in every route or via dependencies
+- project structure conventions (FastAPI doesn't impose any, so codebases differ)
+
+**Choosing Django for a pure inference or streaming service, you'll carry:**
+
+- an ORM, admin, and settings sprawl you don't use
+- sync-oriented DRF where you wanted async end to end
+- heavier startup and memory per process than a thin service
+- awkward fits for long-lived connections
+
+Neither is fatal. The cost is **paying for features you don't use** (Django) or **rebuilding features you do** (FastAPI).
+
+## Part 7: The decision flow
+
+```
+Does the product need an admin/back-office, users, and relational data?
+ ├─ yes ──► Django (or Django + Ninja if you want typed APIs)
+ └─ no
+     Is it mostly a stateless service, model server, or gateway?
+      ├─ yes ──► Is it I/O-fan-out, streaming, or ML serving?
+      │            ├─ yes ──► FastAPI
+      │            └─ no  ──► Either; choose by team familiarity
+      └─ no ──► Mixed system?
+                  └─ Django core + FastAPI services for the specialized parts
+```
+
+Questions that override the flow:
+
+1. **What does the team already know?** A skilled FastAPI team shouldn't switch for an admin they could replace.
+2. **How long will this live?** Long-lived products benefit from Django's conventions.
+3. **Who consumes it?** Many external teams → typed OpenAPI contracts weigh more.
+4. **What's the bottleneck?** If it's the database, the framework choice barely matters.
+
+## Part 8: Practice scenarios (do this before reading answers)
+
+For each, write: **choice, one reason, one risk, what would change your mind.**
+
+1. A startup's e-commerce site with a catalog, orders, and a staff back office.
+2. A service that wraps a PyTorch model and exposes `/predict`.
+3. A webhook receiver that fans out to 6 third-party APIs per event.
+4. An internal HR tool: forms, approvals, role-based access, reports.
+5. A public API for a mobile app, 5-person team, all familiar with Django.
+6. A chat service with thousands of open WebSocket connections.
+7. A university department's content site, edited by non-technical staff.
+8. A data team's lightweight service exposing 3 read-only endpoints over a warehouse.
+
+<details>
+<summary>My answers (compare, and defend any difference)</summary>
+
+1. **Django.** Admin, auth, ORM, and transactions (orders need atomic writes). Risk: coarse scaling, so offload with Celery and caching. Change my mind if the team is all FastAPI.
+2. **FastAPI.** Typed I/O, a lightweight process holding the model, auto-docs. Risk: CPU-bound inference blocks the event loop, so use `def` endpoints or a worker pool and a proper model server if load grows.
+3. **FastAPI.** Concurrent outbound calls with `httpx.AsyncClient` and `asyncio.gather`. Risk: partial-failure handling and retries (consider a queue).
+4. **Django.** Roles, forms, admin, and reports are its sweet spot. Risk: low. Change my mind only for a very strong FastAPI team.
+5. **Django + DRF**, possibly Ninja. Team familiarity beats theoretical advantages. Risk: DRF ceremony, so consider Ninja for lighter endpoints.
+6. **FastAPI** (or Django Channels if there's a large Django core already). Risk: state and fan-out across instances, so you'll need a pub/sub backend like Redis, and sticky-session issues from Day 21.
+7. **Django** (or a CMS built on it). Editors need an admin. This is the clearest case of all.
+8. **FastAPI.** Small, read-only, no admin or users needed. Risk: it grows into "a framework we're slowly rebuilding", so watch scope.
+</details>
+
+Scoring: 6 or more matching with sound reasons is solid. Mismatches are fine if your reasoning holds, and that's the skill.
+
+## Part 9: Write the one-page decision guide
+
+Use this skeleton, then fill it in your own words. The value is in your wording, so don't copy mine.
+
+```markdown
+# Choosing Django or FastAPI (1 page)
+
+## Default
+(Which do you pick when you know nothing else, and why?)
+
+## Pick Django when
+- (3 to 4 conditions, each concrete)
+
+## Pick FastAPI when
+- (3 to 4 conditions, each concrete)
+
+## It barely matters when
+- (The conditions where the team's familiarity decides.)
+
+## Hybrid options
+- (Django Ninja; Django core + FastAPI service. When each fits.)
+
+## Questions to ask first
+1. Who edits the data? 2. What's the bottleneck? 3. What does the team know?
+4. What will we have to build ourselves? 5. How long will this live?
+
+## Traps
+- (Two for each framework, from your own experience in this course.)
+
+## What would change this advice
+- (Async maturing in Django, a FastAPI admin ecosystem, team size, etc.)
+```
+
+Constraints that make it good: **one page**, every bullet has a *because*, and the "traps" section comes from things that actually bit you (the Day 20 per-process counter, the Day 10 401 vs 403, a blocked event loop).
+
+## Part 10: Hands-on (60 min, optional but recommended)
+
+Build the sidecar from Part 5 so the comparison isn't only theoretical.
+
+**1. A minimal FastAPI service** (`pip install fastapi uvicorn httpx`):
+
+```python
+# sentiment_service/main.py
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
+
+app = FastAPI(title="Sentiment service")
+
+
+class In(BaseModel):
+    text: str = Field(min_length=1, max_length=5000)
+
+
+class Out(BaseModel):
+    label: str
+    score: float
+
+
+@app.post("/predict", response_model=Out)
+def predict(body: In):                      # `def`: CPU-bound work runs in the threadpool
+    positives = {"great", "good", "love", "nice"}
+    hits = sum(w.strip(".,!").lower() in positives for w in body.text.split())
+    return Out(label="positive" if hits else "neutral", score=min(1.0, hits / 3))
+```
+
+```bash
+uvicorn main:app --port 9100
+# open http://127.0.0.1:9100/docs
+```
+
+You get typed validation, a 422 on bad input, and interactive docs for free. That's FastAPI's strength, shown in about 20 lines.
+
+**2. Call it from Django through Celery** (so a slow or down sidecar never blocks a request):
+
+```python
+# posts/tasks.py
+import httpx
+
+@shared_task(bind=True, max_retries=3, ignore_result=True)
+def score_comment(self, comment_id):
+    comment = Comment.objects.filter(pk=comment_id).first()
+    if comment is None:
+        return
+    try:
+        r = httpx.post("http://127.0.0.1:9100/predict",
+                       json={"text": comment.body}, timeout=2.0)
+        r.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise self.retry(exc=exc, countdown=30 * 2 ** self.request.retries)
+    Comment.objects.filter(pk=comment.pk).update(sentiment=r.json()["label"])
+```
+
+(Add a `sentiment` `CharField(blank=True)` to `Comment` and migrate.) Trigger it through an `on_commit` receiver, like Day 18.
+
+**3. Observe the seams:** stop the sidecar and watch retries; send 6,000 characters and see the 422; compare the lines of code in each service for the same validation rule.
+
+## Experiments (30 min)
+
+1. **Block the loop.** Add `async def slow(): time.sleep(3)` to FastAPI, then hit it with two concurrent `curl`s and time them. Change to `def` and compare.
+2. **Same endpoint, both frameworks.** Implement `GET /posts/` against the same Postgres (FastAPI with SQLAlchemy). Run `ab -n 1000 -c 50` against each. Record requests per second **and** what your result says about where time goes. Treat the numbers as yours alone, not general truths.
+3. **Fan-out.** Write one endpoint that calls three 300 ms stub URLs. Compare sequential `requests` (about 900 ms) with `asyncio.gather` and `httpx.AsyncClient` (about 300 ms).
+4. **Validation parity.** Reproduce Day 8's `validate_title` rule in Pydantic (`field_validator`) and compare the error response shapes. Then reshape FastAPI's 422 into Day 23's error envelope (hint: a `RequestValidationError` handler).
+5. **Docs parity.** Generate a schema from the Django side with `drf-spectacular` and compare it with FastAPI's `/openapi.json`.
+6. **Auth parity.** Sketch the dependency chain for "must be author or staff" in FastAPI (`Depends(get_current_user)`, then an inline check) versus your `IsAuthorOrReadOnly`. Which is easier to forget on a new route?
+7. **Try Django Ninja** (`pip install django-ninja`): rebuild `GET /posts/` with a typed schema inside your existing project.
+8. **Startup and memory.** Compare the idle memory of each process (`ps`, `docker stats`). Notice what you're measuring: a configured framework, not a product.
+
+## Stretch goals
+
+- Run the FastAPI service in your Day 21 Compose stack behind the same nginx, routed by path (`/ml/`).
+- Add a **circuit breaker** around the sidecar call: after N failures, skip it for a minute.
+- Serve a real small model (a scikit-learn or tiny transformer) and measure the event-loop effect of CPU-bound inference.
+- Write a fuller **ADR** (Day 22 format) for "Why the blog stays Django and sentiment is a FastAPI sidecar".
+- Add ASGI to your Django project (`uvicorn blog_platform.asgi:application`) and make one genuinely async view that awaits an HTTP call. Note what still runs in threads.
+- Read the current Django async documentation and list what's truly async and what isn't.
+
+## Day 24 checklist
+
+- [ ] Can explain what async does and doesn't speed up
+- [ ] Can explain the blocking-call-in-`async def` bug and two fixes
+- [ ] Can name three situations where each framework wins and a "barely matters" zone
+- [ ] Can describe Django Ninja and the sidecar pattern, and when each fits
+- [ ] Answered the 8 scenarios before reading my answers
+- [ ] Wrote the one-page guide in your own words, with a *because* on every bullet
+- [ ] (Optional) FastAPI sentiment service running and called from Celery
+- [ ] Ran at least one measurement yourself instead of trusting a benchmark
+
+## Common gotchas
+
+- **Choosing by benchmark headlines.** Framework benchmarks usually measure trivial endpoints. Your bottleneck is almost certainly the database or a slow dependency.
+- **Blocking calls in `async def`.** `time.sleep`, `requests`, sync DB drivers, or heavy CPU work stall every request on that loop.
+- **"Async everywhere" assumed to be faster.** It raises concurrency for waiting work and adds complexity and debugging cost otherwise.
+- **Underestimating the batteries FastAPI lacks.** Admin, auth flows, permissions, and migrations are weeks of work to match.
+- **Overestimating Django's lock-in.** Celery, Redis, Postgres, and signals-based boundaries (Day 22) make extracting services feasible.
+- **Mixing ORMs.** Two data layers in one codebase means two migration stories and two sources of truth.
+- **Deciding on resume appeal or trends.** Pick for the product and the team.
+- **Hybrid without boundaries.** A FastAPI sidecar that reads Django's tables directly is a distributed monolith (Day 22). It should have its own data or an API.
+- **Skipping timeouts on cross-service calls.** Every HTTP call between services needs a timeout and a failure plan.
+- **Treating the decision as permanent.** Write down what would make you revisit it.
+
+Day 25 can go one of two ways. One is **API documentation and testing** (`drf-spectacular`, `schemathesis`, and a CI pipeline that fails on contract drift), continuing Day 23's contract work. The other is the **database scaling** day that has been waiting since Day 21: indexes and `EXPLAIN ANALYZE`, PgBouncer, and read replicas. Which do you want next?
