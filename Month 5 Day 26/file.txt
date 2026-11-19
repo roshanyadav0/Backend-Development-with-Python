@@ -1,0 +1,619 @@
+# Day 26: Blog API, Posts & Categories
+
+You skipped Day 25 (docs/testing vs. database scaling). Nothing today depends on it.
+
+Today is a **build day**: you assemble Days 7-23 into one clean `posts` and `categories` API, then test it. The spec:
+
+| Requirement | Where it lands |
+|---|---|
+| Posts CRUD, ViewSet + Router | `PostViewSet`, `DefaultRouter` |
+| Categories assigned to posts | writable `categories` field (by slug) |
+| Filter by category | `?category=django` |
+| Search by title or body | `?search=orm` |
+| 10 per page | `StandardPagination` |
+| Test in the browsable API | Part 6 walkthrough, plus automated tests in Part 7 |
+
+Build it from memory where you can, as on Days 6 and 13, and use the code below to check yourself.
+
+## Part 1: The endpoints
+
+```
+GET    /api/v1/categories/                 list (search, ordering, paginated)
+POST   /api/v1/categories/                 create          (staff only)
+GET    /api/v1/categories/{slug}/          retrieve
+PUT/PATCH/DELETE /api/v1/categories/{slug}/                (staff only)
+
+GET    /api/v1/posts/                      list: ?search= ?category= ?author= ?status= ?ordering= ?page= ?page_size=
+POST   /api/v1/posts/                      create          (authenticated)
+GET    /api/v1/posts/{slug}/               retrieve
+PUT/PATCH/DELETE /api/v1/posts/{slug}/                     (author or staff)
+```
+
+Visibility rules:
+
+- Anonymous users see **published** posts only.
+- Authenticated users also see **their own drafts**.
+- Staff see everything.
+- Someone else's draft returns **404**, not 403, so its existence isn't revealed (Day 9).
+
+## Part 2: Permissions
+
+**posts/permissions.py** (consolidated from Days 10 and 13)
+```python
+from rest_framework import permissions
+
+
+class IsAuthorOrReadOnly(permissions.BasePermission):
+    message = "You can only modify your own content."
+
+    def has_permission(self, request, view):
+        return (
+            request.method in permissions.SAFE_METHODS
+            or bool(request.user and request.user.is_authenticated)
+        )
+
+    def has_object_permission(self, request, view, obj):
+        if request.method in permissions.SAFE_METHODS:
+            return True
+        return request.user.is_staff or obj.author_id == request.user.id
+
+
+class IsAdminOrReadOnly(permissions.BasePermission):
+    message = "Only staff can modify this resource."
+
+    def has_permission(self, request, view):
+        return request.method in permissions.SAFE_METHODS or bool(
+            request.user and request.user.is_staff
+        )
+```
+
+## Part 3: Serializers
+
+**posts/serializers.py**
+```python
+from django.contrib.auth import get_user_model
+from django.urls import reverse
+from rest_framework import serializers
+
+from .models import Category, Post
+
+
+class AuthorSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = get_user_model()
+        fields = ["id", "username"]
+
+
+class CategorySerializer(serializers.ModelSerializer):
+    post_count = serializers.IntegerField(read_only=True)   # annotated in the viewset
+
+    class Meta:
+        model = Category
+        fields = ["id", "name", "slug", "post_count"]
+        read_only_fields = ["id"]
+
+
+class PostListSerializer(serializers.ModelSerializer):
+    author = AuthorSerializer(read_only=True)
+    categories = serializers.SlugRelatedField(
+        many=True, slug_field="slug", queryset=Category.objects.all(), required=False
+    )
+    comment_count = serializers.IntegerField(read_only=True)
+    like_count = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = Post
+        fields = [
+            "id", "title", "slug", "author", "status", "categories",
+            "comment_count", "like_count", "created_at", "published_at",
+        ]
+        read_only_fields = ["id", "created_at", "published_at"]
+
+
+class PostDetailSerializer(PostListSerializer):
+    comments_url = serializers.SerializerMethodField()
+
+    class Meta(PostListSerializer.Meta):
+        fields = PostListSerializer.Meta.fields + ["body", "comments_url", "updated_at"]
+        read_only_fields = PostListSerializer.Meta.read_only_fields + ["updated_at"]
+
+    def get_comments_url(self, obj):
+        return reverse("posts_api:comment-list", kwargs={"post_slug": obj.slug})
+
+    def validate_title(self, value):
+        value = value.strip()
+        if len(value) < 5:
+            raise serializers.ValidationError("Title must be at least 5 characters.")
+        return value
+
+    def validate_categories(self, value):
+        if len(value) > 5:
+            raise serializers.ValidationError("A post can have at most 5 categories.")
+        return value
+
+    def validate(self, attrs):
+        status = attrs.get("status", getattr(self.instance, "status", None))
+        body = attrs.get("body", getattr(self.instance, "body", ""))
+        if status == Post.Status.PUBLISHED and len(body) < 50:
+            raise serializers.ValidationError(
+                {"body": "A published post needs at least 50 characters."}
+            )
+        return attrs
+```
+
+Points worth understanding:
+
+- **How categories get assigned.** `SlugRelatedField(many=True, queryset=...)` accepts `"categories": ["django", "python"]`. An unknown slug returns 400, since the field validates every value against the queryset. `PATCH` with `categories` **replaces the whole set**, and omitting it leaves the set unchanged.
+- **`required=False`** lets a post be created with no categories.
+- **Counts on create.** `comment_count` and `like_count` come from the viewset's `annotate`. A freshly created instance has no such attribute, and DRF skips read-only fields it can't find, so the 201 response simply omits them.
+- **The list serializer is the light one.** Validation lives on the detail serializer, which `get_serializer_class` uses for every write.
+
+## Part 4: Filtering and pagination
+
+**posts/filters.py** (Day 11, unchanged in shape)
+```python
+import django_filters as filters
+
+from .models import Category, Post
+
+
+class PostFilter(filters.FilterSet):
+    category = filters.ModelMultipleChoiceFilter(
+        field_name="categories__slug",
+        to_field_name="slug",
+        queryset=Category.objects.all(),
+        conjoined=False,                      # ?category=a&category=b means a OR b
+    )
+    author = filters.CharFilter(field_name="author__username", lookup_expr="iexact")
+    created_after = filters.DateFilter(field_name="created_at", lookup_expr="date__gte")
+    created_before = filters.DateFilter(field_name="created_at", lookup_expr="date__lte")
+
+    class Meta:
+        model = Post
+        fields = ["status", "category", "author", "created_after", "created_before"]
+```
+
+**posts/pagination.py**
+```python
+from rest_framework.pagination import PageNumberPagination
+
+
+class StandardPagination(PageNumberPagination):
+    page_size = 10
+    page_size_query_param = "page_size"
+    max_page_size = 50
+```
+
+**settings.py** (the relevant part)
+```python
+REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework.authentication.TokenAuthentication",      # first: anonymous gets 401
+        "rest_framework.authentication.SessionAuthentication",    # browsable API login
+    ],
+    "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.IsAuthenticatedOrReadOnly"],
+    "DEFAULT_FILTER_BACKENDS": [
+        "django_filters.rest_framework.DjangoFilterBackend",
+        "rest_framework.filters.SearchFilter",
+        "rest_framework.filters.OrderingFilter",
+    ],
+    "DEFAULT_PAGINATION_CLASS": "posts.pagination.StandardPagination",
+    "PAGE_SIZE": 10,
+    "EXCEPTION_HANDLER": "posts.exceptions.api_exception_handler",   # Day 23
+}
+```
+
+## Part 5: ViewSets and routing
+
+**posts/views.py** (only the parts that matter today; keep your `like`, `popular`, and comments code from earlier days where the `...` is)
+```python
+from django.db.models import Count, Q
+from rest_framework import viewsets
+from rest_framework.permissions import AllowAny, IsAuthenticated
+
+from .filters import PostFilter
+from .idempotency import IdempotentCreateMixin            # Day 23; drop it if you skipped that
+from .models import Category, Post
+from .pagination import StandardPagination
+from .permissions import IsAdminOrReadOnly, IsAuthorOrReadOnly
+from .serializers import (
+    CategorySerializer, PostDetailSerializer, PostListSerializer,
+)
+
+
+class CategoryViewSet(viewsets.ModelViewSet):
+    serializer_class = CategorySerializer
+    lookup_field = "slug"
+    permission_classes = [IsAdminOrReadOnly]
+    pagination_class = StandardPagination
+    search_fields = ["name"]
+    ordering_fields = ["name", "post_count"]
+    ordering = ["name"]
+
+    def get_queryset(self):
+        return Category.objects.annotate(
+            post_count=Count(
+                "posts",
+                filter=Q(posts__status=Post.Status.PUBLISHED),
+                distinct=True,
+            )
+        )
+
+
+class PostViewSet(IdempotentCreateMixin, viewsets.ModelViewSet):
+    lookup_field = "slug"
+    pagination_class = StandardPagination
+    filterset_class = PostFilter
+    search_fields = ["title", "body", "author__username", "categories__name"]
+    ordering_fields = ["created_at", "title", "comment_count", "like_count"]
+    ordering = ["-created_at", "-id"]            # the id tiebreaker keeps pages stable
+
+    def get_queryset(self):
+        qs = (
+            Post.objects
+            .select_related("author")
+            .prefetch_related("categories")
+            .annotate(
+                comment_count=Count("comments", distinct=True),
+                like_count=Count("likes", distinct=True),
+            )
+        )
+        user = self.request.user
+        if user.is_staff:
+            return qs
+        if user.is_authenticated:
+            return qs.filter(Q(status=Post.Status.PUBLISHED) | Q(author=user))
+        return qs.filter(status=Post.Status.PUBLISHED)
+
+    def get_serializer_class(self):
+        return PostListSerializer if self.action == "list" else PostDetailSerializer
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve", "popular"):
+            classes = [AllowAny]
+        else:   # create, update, partial_update, destroy, like
+            classes = [IsAuthenticated, IsAuthorOrReadOnly]
+        return [cls() for cls in classes]
+
+    def perform_create(self, serializer):
+        serializer.save(author=self.request.user)
+
+    # ... like, popular, retrieve cache, get_success_headers from earlier days ...
+```
+
+Why it's built this way:
+
+- **Visibility lives in `get_queryset`**, so it applies to *every* action. An author can `PATCH` their own draft, and nobody else can even discover it.
+- **`Q(...) | Q(author=user)` doesn't add a join**, so it can't duplicate rows.
+- **`distinct=True` on both counts** is still required. Filtering by `categories__slug` adds a join, and without `distinct` the counts would multiply across joins (Day 8).
+- **Category writes are staff-only**, but anyone can read them.
+- **Deleting a category** removes its links to posts, **not the posts themselves**, because it's a ManyToMany relation.
+
+**posts/api_urls.py**
+```python
+from django.urls import include, path
+from rest_framework.routers import DefaultRouter
+
+from . import views
+
+app_name = "posts_api"
+
+router = DefaultRouter()
+router.register("posts", views.PostViewSet, basename="post")
+router.register("categories", views.CategoryViewSet, basename="category")
+
+urlpatterns = [
+    path("", include(router.urls)),
+    # auth, comment routes, etc. from earlier days
+]
+```
+
+Add `path("api-auth/", include("rest_framework.urls"))` to the **root** `urls.py`. It gives the browsable API a login and logout link.
+
+## Part 6: Seed data and test in the browsable API
+
+### Seed command
+
+**posts/management/commands/seed_blog.py** (create `management/__init__.py` and `management/commands/__init__.py` too)
+```python
+from django.contrib.auth import get_user_model
+from django.core.management.base import BaseCommand
+
+from posts.models import Category, Post
+
+
+class Command(BaseCommand):
+    help = "Create demo users, categories, and 30 posts (safe to re-run)."
+
+    def handle(self, *args, **options):
+        User = get_user_model()
+
+        def user(name, **extra):
+            u, created = User.objects.get_or_create(username=name, defaults=extra)
+            if created:
+                u.set_password("pass12345")
+                u.save()
+            return u
+
+        alice = user("alice", email="alice@example.com")
+        bob = user("bob", email="bob@example.com")
+        user("staffer", email="staff@example.com", is_staff=True)
+
+        cats = [
+            Category.objects.get_or_create(name=n, defaults={"slug": n.lower()})[0]
+            for n in ("Tech", "Django", "Python")
+        ]
+        for i in range(1, 31):
+            post, _ = Post.objects.get_or_create(
+                slug=f"sample-post-{i}",
+                defaults=dict(
+                    author=alice if i % 2 else bob,
+                    title=f"Sample post {i}" + (" about the Django ORM" if i % 3 == 0 else ""),
+                    body=("Lorem ipsum dolor sit amet. " * 3) + ("select_related rocks" if i % 5 == 0 else ""),
+                    status=Post.Status.DRAFT if i % 4 == 0 else Post.Status.PUBLISHED,
+                ),
+            )
+            post.categories.add(cats[i % 3])
+        self.stdout.write(self.style.SUCCESS("Seeded."))
+```
+
+```bash
+python manage.py seed_blog
+python manage.py runserver
+```
+
+The published posts trigger Day 12's `post_published` signal, which calls `.delay()`. Start Redis and a worker first, or you'll see logged broker errors. The seed still completes either way, because of `send_robust`.
+
+### Walk through it
+
+Open **http://127.0.0.1:8000/api/v1/**, which is the API root listing `posts` and `categories`. Use the **Filters** button on the list pages. **Log in** through the `api-auth/login/` link, or through `/admin/` first. For each row, **write down the status code you expect before you click**:
+
+| # | Action | Expected |
+|---|---|---|
+| 1 | Anonymous `GET /posts/` | 200, `count` excludes drafts, 10 results |
+| 2 | `?page=2`, then `?page=999` | 200 with `previous` set, then 404 |
+| 3 | `?page_size=1000` | 200, at most 50 results |
+| 4 | `?category=django` | only Django posts |
+| 5 | `?category=django&category=python` | posts in either |
+| 6 | `?category=nope` | 400 (`validation_error`) |
+| 7 | `?search=orm` | posts mentioning "orm" in the title or body |
+| 8 | `?search=orm&category=django&page=1` | `next` link keeps both filters |
+| 9 | `?ordering=title`, `?ordering=-like_count` | sorted accordingly |
+| 10 | `?status=draft` as anonymous | 200, **empty** (filters aren't access) |
+| 11 | Anonymous `POST /posts/` | 401 |
+| 12 | Log in as bob, `POST` with title `"Hi"` | 400, error on `title` |
+| 13 | `POST` valid data with `"categories": ["django"]` | 201, `Location` header, author is bob |
+| 14 | `POST` with `"categories": ["django", "ghost"]` | 400, error on `categories` |
+| 15 | `POST` with `"status": "published"` and a 20-char body | 400, error on `body` |
+| 16 | `PATCH` your own post with `{"categories": ["python"]}` | 200, categories **replaced** |
+| 17 | `PATCH` alice's published post as bob | 403 with your message |
+| 18 | `GET` alice's draft as bob | 404 |
+| 19 | `GET` alice's draft as alice | 200 |
+| 20 | `DELETE` your post, then `DELETE` again | 204, then 404 |
+| 21 | `GET /categories/` | 200, each with `post_count` (published only) |
+| 22 | `POST /categories/` as bob | 403 |
+| 23 | `POST /categories/` as `staffer` | 201 |
+| 24 | `DELETE /categories/{slug}/` as `staffer` | 204, posts still exist |
+
+Score yourself on how many codes you predicted correctly, and note every miss in `NOTES.md`.
+
+For raw-JSON checks from the terminal, get a token from your login endpoint first:
+
+```bash
+curl -s "http://127.0.0.1:8000/api/v1/posts/?search=orm&category=django&page=1" | python -m json.tool
+curl -s -X POST http://127.0.0.1:8000/api/v1/posts/ \
+  -H "Authorization: Token $TOKEN" -H "Content-Type: application/json" \
+  -d '{"title":"Created by curl","slug":"by-curl","body":"A body long enough to satisfy validation, at least fifty chars.","categories":["django"]}'
+```
+
+## Part 7: Automated tests
+
+These lock in what you just checked by hand. They use LocMem (Day 15) and zero-padded titles, which avoids the Day 11 mistake where "number 7" also matched "number 17".
+
+```python
+from django.contrib.auth import get_user_model
+from django.core.cache import cache
+from django.test import override_settings
+from rest_framework.test import APITestCase
+
+from .models import Category, Post
+
+User = get_user_model()
+LOCMEM = {"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}}
+BODY = "x" * 60
+
+
+@override_settings(CACHES=LOCMEM)
+class PostCategoryAPITests(APITestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.alice = User.objects.create_user("alice", password="pass12345")
+        cls.bob = User.objects.create_user("bob", password="pass12345")
+        cls.staff = User.objects.create_user("staffer", password="pass12345", is_staff=True)
+        cls.django = Category.objects.create(name="Django", slug="django")
+        cls.python = Category.objects.create(name="Python", slug="python")
+        for i in range(25):
+            p = Post.objects.create(
+                author=cls.alice, title=f"Post number {i:02d}", slug=f"post-{i:02d}",
+                body=BODY, status=Post.Status.PUBLISHED,
+            )
+            p.categories.add(cls.django if i % 5 == 0 else cls.python)   # 5 django, 20 python
+        Post.objects.create(author=cls.alice, title="Alice draft", slug="alice-draft", body=BODY)
+
+    def setUp(self):
+        cache.clear()
+
+    # --- reading, filtering, searching, pagination ---
+    def test_list_is_paginated_and_hides_drafts(self):
+        r = self.client.get("/api/v1/posts/")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["count"], 25)
+        self.assertEqual(len(r.json()["results"]), 10)
+
+    def test_page_size_capped_and_bad_page_404(self):
+        self.assertLessEqual(len(self.client.get("/api/v1/posts/?page_size=1000").json()["results"]), 50)
+        self.assertEqual(self.client.get("/api/v1/posts/?page=99").status_code, 404)
+
+    def test_filter_by_category(self):
+        self.assertEqual(self.client.get("/api/v1/posts/?category=django").json()["count"], 5)
+
+    def test_filter_by_several_categories_is_or(self):
+        r = self.client.get("/api/v1/posts/?category=django&category=python")
+        self.assertEqual(r.json()["count"], 25)
+
+    def test_unknown_category_is_400(self):
+        r = self.client.get("/api/v1/posts/?category=nope")
+        self.assertEqual(r.status_code, 400)
+
+    def test_search(self):
+        self.assertEqual(self.client.get("/api/v1/posts/?search=number 07").json()["count"], 1)
+
+    def test_search_filter_and_page_combine(self):
+        r = self.client.get("/api/v1/posts/?category=python&search=Post&page=2&page_size=10")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["count"], 20)
+        self.assertEqual(len(r.json()["results"]), 10)
+
+    def test_ordering(self):
+        r = self.client.get("/api/v1/posts/?ordering=title")
+        self.assertEqual(r.json()["results"][0]["title"], "Post number 00")
+
+    # --- visibility ---
+    def test_draft_hidden_from_others_visible_to_author(self):
+        self.assertEqual(self.client.get("/api/v1/posts/alice-draft/").status_code, 404)
+        self.client.force_authenticate(self.bob)
+        self.assertEqual(self.client.get("/api/v1/posts/alice-draft/").status_code, 404)
+        self.client.force_authenticate(self.alice)
+        self.assertEqual(self.client.get("/api/v1/posts/alice-draft/").status_code, 200)
+
+    # --- writing ---
+    def test_anonymous_cannot_create(self):
+        r = self.client.post("/api/v1/posts/", {"title": "Nope nope", "slug": "nope", "body": BODY})
+        self.assertEqual(r.status_code, 401)
+
+    def test_create_with_categories(self):
+        self.client.force_authenticate(self.bob)
+        r = self.client.post(
+            "/api/v1/posts/",
+            {"title": "Brand new post", "slug": "brand-new", "body": BODY,
+             "categories": ["django", "python"]},
+            format="json",
+        )
+        self.assertEqual(r.status_code, 201)
+        self.assertEqual(r.json()["author"]["username"], "bob")
+        self.assertEqual(sorted(r.json()["categories"]), ["django", "python"])
+
+    def test_unknown_category_slug_rejected_on_create(self):
+        self.client.force_authenticate(self.bob)
+        r = self.client.post(
+            "/api/v1/posts/",
+            {"title": "Another new post", "slug": "another", "body": BODY, "categories": ["ghost"]},
+            format="json",
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("categories", r.json()["error"]["details"])
+
+    def test_short_title_and_short_published_body_rejected(self):
+        self.client.force_authenticate(self.bob)
+        r = self.client.post("/api/v1/posts/", {"title": "Hi", "slug": "hi", "body": BODY}, format="json")
+        self.assertIn("title", r.json()["error"]["details"])
+        r = self.client.post(
+            "/api/v1/posts/",
+            {"title": "Valid title", "slug": "valid", "body": "short", "status": "published"},
+            format="json",
+        )
+        self.assertIn("body", r.json()["error"]["details"])
+
+    def test_patch_replaces_categories(self):
+        self.client.force_authenticate(self.alice)
+        r = self.client.patch("/api/v1/posts/post-00/", {"categories": ["python"]}, format="json")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["categories"], ["python"])
+
+    def test_only_author_or_staff_can_modify(self):
+        self.client.force_authenticate(self.bob)
+        self.assertEqual(
+            self.client.patch("/api/v1/posts/post-01/", {"title": "Hacked title"}, format="json").status_code, 403)
+        self.client.force_authenticate(self.alice)
+        self.assertEqual(
+            self.client.patch("/api/v1/posts/post-01/", {"title": "Edited title"}, format="json").status_code, 200)
+        self.client.force_authenticate(self.staff)
+        self.assertEqual(self.client.delete("/api/v1/posts/post-02/").status_code, 204)
+
+    # --- categories ---
+    def test_category_list_public_with_published_counts(self):
+        r = self.client.get("/api/v1/categories/")
+        self.assertEqual(r.status_code, 200)
+        counts = {c["slug"]: c["post_count"] for c in r.json()["results"]}
+        self.assertEqual(counts, {"django": 5, "python": 20})
+
+    def test_category_writes_are_staff_only(self):
+        payload = {"name": "Tech", "slug": "tech"}
+        self.assertEqual(self.client.post("/api/v1/categories/", payload).status_code, 401)
+        self.client.force_authenticate(self.bob)
+        self.assertEqual(self.client.post("/api/v1/categories/", payload).status_code, 403)
+        self.client.force_authenticate(self.staff)
+        self.assertEqual(self.client.post("/api/v1/categories/", payload).status_code, 201)
+
+    def test_deleting_category_keeps_posts(self):
+        self.client.force_authenticate(self.staff)
+        self.assertEqual(self.client.delete("/api/v1/categories/django/").status_code, 204)
+        self.assertTrue(Post.objects.filter(slug="post-00").exists())
+```
+
+```bash
+python manage.py test posts
+```
+
+Two notes on the tests:
+
+- **The cache.** If you kept Day 15's anonymous list caching, `cache.clear()` in `setUp` is mandatory, and the anonymous tests each make only one list call. Test transactions never commit, so the invalidation callbacks don't run.
+- **The `format="json"`** on writes is needed because `categories` is a list. The default multipart format handles lists awkwardly.
+
+## Experiments (25 min)
+
+1. Run `print(PostViewSet().filter_queryset(...).query)` for `?category=django&search=orm` in the shell and read the JOINs and `DISTINCT`.
+2. Count queries for `GET /api/v1/posts/` with `assertNumQueries`, using 5 posts, then 25. The count must not grow.
+3. Remove `distinct=True` from the `like_count` annotation, filter by two categories, and watch the counts inflate. Restore it.
+4. Remove the `-id` tiebreaker and compare pages when many posts share a timestamp.
+5. Try `PUT` (full replace) without `categories`. Does the set change? (It shouldn't.)
+6. Try `?ordering=body`. It's ignored because it isn't whitelisted.
+7. Rename a category slug in the admin and see what happens to `?category=old-slug` (400) and to the post-to-category links (they hold, because they reference the row id).
+8. Switch the staff user's token to a normal user's and re-run rows 22 to 24.
+
+## Stretch goals
+
+- Add `GET /categories/{slug}/posts/` as an `@action`, returning that category's published posts with the same pagination.
+- Add `POST` and `DELETE /posts/{slug}/categories/{category_slug}/` to add or remove **one** category without resending the whole list.
+- Auto-generate `slug` from the title on create (`slugify` plus a numeric suffix on collision), and make it read-only after creation.
+- Add `?has_comments=true` and `?min_likes=5` filters (Day 11 stretch).
+- Add `CommentFilter` so the comments endpoint matches the posts one.
+- Switch the posts list to `CursorPagination` in a scratch viewset and compare behavior while inserting posts.
+
+## Day 26 checklist
+
+- [ ] Categories CRUD working, staff-only writes
+- [ ] Posts CRUD working through one `PostViewSet` and a router
+- [ ] Categories assigned through `"categories": [slugs]`, with unknown slugs rejected
+- [ ] `?category=`, `?search=`, `?ordering=` and `?page=` work together
+- [ ] 10 per page, `page_size` capped at 50
+- [ ] Drafts hidden from others (404), visible to their author
+- [ ] Walked the 24-row browsable API table and predicted codes first
+- [ ] Contract tests pass (`python manage.py test posts`)
+- [ ] Can explain why `distinct=True` is on the counts and why `-id` ends the ordering
+
+## Common gotchas
+
+- **`PATCH` with `categories` replaces, not appends.** Clients that want "add one" need the stretch endpoint.
+- **Inflated counts after a category filter**: the `Count()` calls lost `distinct=True`.
+- **Duplicate posts in results**: a custom filter crossing a to-many relation without `.distinct()`. `ModelMultipleChoiceFilter` and `SearchFilter` handle this themselves.
+- **Forgetting `format="json"`** in tests when sending lists.
+- **`basename` assertion error**: `get_queryset()` without a `queryset` attribute needs `basename=` in `router.register`.
+- **Filters treated as security**: `?status=draft` narrows results but never grants access. Visibility belongs in `get_queryset`.
+- **Anonymous list cached with authenticated data**: only cache anonymous requests (Day 15).
+- **`post_count` missing on create**: expected, since it's an annotation. Re-fetch if a client needs it.
+- **Slug edits break links and orphan cache keys** (Day 16): consider freezing slugs after creation.
+- **Leaving `PostListAPIView` from Day 7** in the urls shadows the router.
+- **Seeding without Redis/worker running**: published posts try to queue emails, so expect logged errors.
+
+Day 27 is naturally **comments and likes**: nested comment routes, PUT/DELETE likes, per-user permissions, and counts that stay correct. It's the other half of the blog API. Want that outline next?
